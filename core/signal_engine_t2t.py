@@ -1,14 +1,20 @@
 """
-signal_engine_t2t.py — Time-to-Target physics engine.
+signal_engine_t2t.py — Time-to-Target expected-value engine.
 
 Entry logic:
   1. Compute distance = |btc_current - btc_target|
   2. Compute time_remaining = close_ts - now  (seconds)
-  3. velocity_needed = distance / time_remaining
-  4. If velocity_needed > MAX_BTC_VELOCITY → physically impossible to reach target.
-     → The LOSING side (contracts betting BTC hits the target) should crash to near 0.
-     → The WINNING side (contracts betting BTC stays away from target) should be near 1.
-  5. Enter on the WINNING side when ask <= MAX_WINNING_ASK (market hasn't fully priced it in).
+  3. Model P(reach) = probability BTC reaches target within time_remaining,
+     using Gaussian diffusion (reflection principle):
+       P(reach) = erfc(distance / (sigma * sqrt(2 * time_remaining)))
+     where sigma is realized per-second BTC price volatility from recent candles.
+  4. Compute EV = P(win) * (1 - entry_price) - P(reach) * FIXED_RISK
+     where P(win) = 1 - P(reach).
+  5. Enter on the WINNING side when EV > MIN_EV and ask <= MAX_WINNING_ASK.
+
+The EV gate replaces the old hard velocity threshold: instead of a binary
+"physically impossible", we require the market to offer genuine positive
+expected value after accounting for realized volatility and stop-loss risk.
 
 Only fires in the final MAX_ENTRY_SECS seconds of the contract window.
 Stop loss: entry - FIXED_RISK (same proportional logic as simple96).
@@ -17,6 +23,7 @@ Stop loss: entry - FIXED_RISK (same proportional logic as simple96).
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,11 +36,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_BTC_VELOCITY = 10.0   # $/s — max plausible BTC movement speed
-MAX_ENTRY_SECS   = 120    # only enter in the last 2 minutes of the contract
-MIN_SECS_TO_FILL = 3      # need at least 3s remaining after entry
-MAX_WINNING_ASK  = 0.95   # winning side must be below this (market under-pricing certainty)
-FIXED_RISK       = 0.02   # stop = entry - FIXED_RISK
+MAX_ENTRY_SECS     = 120   # only enter in the last 2 minutes of the contract
+MIN_SECS_TO_FILL   = 3     # need at least 3s remaining after entry
+MAX_WINNING_ASK    = 0.95  # winning side must be below this (market under-pricing certainty)
+FIXED_RISK         = 0.02  # stop = entry - FIXED_RISK
+
+# ── EV / diffusion model parameters ──────────────────────────────────
+BTC_SIGMA_CANDLES  = 20    # number of 15m candles for realized-vol estimate (~5 hours)
+BTC_GRANULARITY    = 900   # seconds per Coinbase 15m candle
+BTC_SIGMA_FALLBACK = 5.0   # $/s fallback when candle history is insufficient
+MIN_EV             = 0.005 # minimum expected value per contract to trigger entry
 
 
 class TimeToTargetEngine:
@@ -123,7 +135,7 @@ class TimeToTargetEngine:
         with self._lock:
             return self._position_side
 
-    # ── Physics helpers ───────────────────────────────────────────────
+    # ── Diffusion model helpers ───────────────────────────────────────
 
     def _secs_remaining(self, ticker: str) -> Optional[float]:
         close = self._close_ts.get(ticker)
@@ -138,8 +150,45 @@ class TimeToTargetEngine:
             close = close.replace(tzinfo=timezone.utc)
         return (close - now).total_seconds()
 
-    def _velocity_needed(self, btc_current: float, btc_target: float, secs: float) -> float:
-        return abs(btc_current - btc_target) / secs
+    def _sigma_per_sec(self) -> float:
+        """Per-second BTC price volatility from recent 15m candles.
+
+        Computes realized vol from close-to-close log returns scaled to per-second.
+        Falls back to BTC_SIGMA_FALLBACK when insufficient history.
+        """
+        candles = self._btc_feed.latest_candles
+        if len(candles) < 3:
+            return BTC_SIGMA_FALLBACK
+        sample = candles[:BTC_SIGMA_CANDLES]
+        closes = [c.close for c in reversed(sample)]
+        if len(closes) < 2:
+            return BTC_SIGMA_FALLBACK
+        returns = [math.log(closes[i + 1] / closes[i]) for i in range(len(closes) - 1)]
+        n = len(returns)
+        mean = sum(returns) / n
+        variance = sum((r - mean) ** 2 for r in returns) / max(n - 1, 1)
+        sigma_candle = math.sqrt(variance)
+        current_price = self._btc_feed.current_price or 0.0
+        if current_price <= 0:
+            return BTC_SIGMA_FALLBACK
+        sigma_per_sec = sigma_candle * current_price / math.sqrt(BTC_GRANULARITY)
+        return max(sigma_per_sec, 0.1)
+
+    def _p_reach(self, btc_current: float, btc_target: float, secs: float, sigma: float) -> float:
+        """P(BTC reaches btc_target within secs seconds) via Gaussian diffusion.
+
+        Reflection principle for 1D Brownian motion with diffusion coefficient sigma:
+          P = erfc(distance / (sigma * sqrt(2 * secs)))
+        """
+        distance = abs(btc_current - btc_target)
+        denom = sigma * math.sqrt(2.0 * secs)
+        if denom <= 0:
+            return 0.0
+        return math.erfc(distance / denom)
+
+    def _expected_value(self, p_reach: float, entry_px: float) -> float:
+        """EV per contract: P(win)*(1-entry) - P(reach)*FIXED_RISK."""
+        return (1.0 - p_reach) * (1.0 - entry_px) - p_reach * FIXED_RISK
 
     # ── Tick processing ───────────────────────────────────────────────
 
@@ -194,7 +243,7 @@ class TimeToTargetEngine:
             if self._pending_entry or self._in_cooldown(ticker):
                 return None
 
-            # ── Physics check ─────────────────────────────────────────
+            # ── Context / time gate ───────────────────────────────────
             btc_target = self._btc_target.get(ticker)
             if btc_target is None or btc_target == 0.0:
                 return None
@@ -207,15 +256,9 @@ class TimeToTargetEngine:
             if secs is None or secs < MIN_SECS_TO_FILL or secs > MAX_ENTRY_SECS:
                 return None
 
-            velocity = self._velocity_needed(btc_current, btc_target, secs)
-            if velocity <= MAX_BTC_VELOCITY:
-                # Target is still reachable — no edge
-                return None
-
-            # ── Target is physically impossible to reach ──────────────
-            # Determine which side WINS (the side betting BTC stays away from target)
-            # If btc_current > btc_target → DOWN move needed → YES (above) is winning
-            # If btc_current < btc_target → UP move needed → NO (below) is winning
+            # ── Determine winning side and candidate entry price ───────
+            # If btc_current > btc_target → DOWN move needed → YES (above) wins
+            # If btc_current < btc_target → UP move needed   → NO (below) wins
             btc_above_target = btc_current > btc_target
             winning_side = "YES" if btc_above_target else "NO"
 
@@ -231,14 +274,24 @@ class TimeToTargetEngine:
                 if entry_px > MAX_WINNING_ASK:
                     return None
 
+            # ── Expected-value gate ────────────────────────────────────
+            # Use realized BTC volatility to model P(target reached in secs).
+            # Only enter when the market offers genuine positive EV after
+            # accounting for the stop-loss risk.
+            sigma   = self._sigma_per_sec()
+            p_reach = self._p_reach(btc_current, btc_target, secs, sigma)
+            ev      = self._expected_value(p_reach, entry_px)
+            if ev < MIN_EV:
+                return None
+
             side = winning_side
             self._position_side = side
             self._pending_entry = True
 
         logger.info(
             "[T2T] SIGNAL: %s  side=%s  entry=%.4f  btc=%.2f  target=%.2f  "
-            "secs=%.1f  velocity_needed=%.2f$/s",
-            ticker, side, entry_px, btc_current, btc_target, secs, velocity,
+            "secs=%.1f  sigma=%.2f$/s  p_reach=%.4f  ev=%.4f",
+            ticker, side, entry_px, btc_current, btc_target, secs, sigma, p_reach, ev,
         )
 
         return Signal(
@@ -247,13 +300,15 @@ class TimeToTargetEngine:
             signal_type=SignalType.ENTRY,
             price=entry_px,
             metadata={
-                "engine":           "t2t",
-                "side":             side,
-                "btc_current":      btc_current,
-                "btc_target":       btc_target,
-                "secs_remaining":   secs,
-                "velocity_needed":  velocity,
-                "best_ask":         best_ask,
-                "best_bid":         best_bid,
+                "engine":      "t2t",
+                "side":        side,
+                "btc_current": btc_current,
+                "btc_target":  btc_target,
+                "secs":        secs,
+                "sigma":       sigma,
+                "p_reach":     p_reach,
+                "ev":          ev,
+                "best_ask":    best_ask,
+                "best_bid":    best_bid,
             },
         )
