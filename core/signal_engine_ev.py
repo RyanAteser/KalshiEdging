@@ -74,6 +74,9 @@ class EVMarketState:
         # Cooldown
         self.cooldown_until: float = 0.0
 
+        # Feature snapshot at last entry signal — used for ML training data logging
+        self.last_entry_features: Optional[dict] = None
+
 
 class EVSignalEngine:
     """
@@ -162,6 +165,14 @@ class EVSignalEngine:
                     return st.stop_price
         return None
 
+    def get_last_features(self, ticker: str) -> Optional[dict]:
+        """Return the feature snapshot from the last entry signal, or None."""
+        st = self._states.get(ticker)
+        if st is None:
+            return None
+        with self._lock:
+            return st.last_entry_features
+
     def get_position_snapshot(self, ticker: str) -> Optional[dict]:
         st = self._states.get(ticker)
         if not st or not st.has_position:
@@ -228,7 +239,8 @@ class EVSignalEngine:
         best_bid: Optional[float],
         best_ask: Optional[float],
         volume: Optional[float],
-    ) -> float:
+    ) -> tuple[float, dict]:
+        """Return (p_model, features_dict). features_dict captured for ML training data."""
         mid = (best_bid + best_ask) / 2.0 if best_bid and best_ask else price
 
         base_p            = mid
@@ -247,6 +259,20 @@ class EVSignalEngine:
              candle_boost + price_spike_boost + cvd_boost)
         p = max(0.01, min(0.99, p))
 
+        features = {
+            "base_p":            base_p,
+            "delta_weight":      delta_weight,
+            "delta_atr":         delta_atr,
+            "ob_imbalance":      ob_imbalance,
+            "cross_asset_boost": cross_asset_boost,
+            "tf_confirm_boost":  tf_confirm_boost,
+            "volume_boost":      volume_boost,
+            "candle_boost":      candle_boost,
+            "price_spike_boost": price_spike_boost,
+            "cvd_boost":         cvd_boost,
+            "p_model":           p,
+        }
+
         logger.debug(
             "[EV] %s p=%.4f base=%.3f Δw=%.4f Δatr=%.4f ob=%.4f "
             "cross=%.4f tf=%.4f vol=%.4f cndl=%.4f spk=%.4f cvd=%.4f",
@@ -254,7 +280,7 @@ class EVSignalEngine:
             cross_asset_boost, tf_confirm_boost, volume_boost,
             candle_boost, price_spike_boost, cvd_boost,
         )
-        return p
+        return p, features
 
     @staticmethod
     def _ev_yes(p_model: float, ask: float, fee_rate: float) -> float:
@@ -414,9 +440,9 @@ class EVSignalEngine:
         if not yes_in_grid and not no_in_grid:
             return None
 
-        volume  = st.volume_history[-1] if st.volume_history else None
-        p_model = self._compute_p_model(st, price, best_bid, best_ask, volume)
-        fee     = cfg.ev_fee_rate
+        volume          = st.volume_history[-1] if st.volume_history else None
+        p_model, feats  = self._compute_p_model(st, price, best_bid, best_ask, volume)
+        fee             = cfg.ev_fee_rate
 
         ev_yes = self._ev_yes(p_model, best_ask, fee) if yes_in_grid else -999.0
         ev_no  = self._ev_no(p_model, no_ask, fee)    if no_in_grid  else -999.0
@@ -430,8 +456,10 @@ class EVSignalEngine:
         else:
             return None
 
-        st.pending_entry = True
-        st.position_side = side
+        st.pending_entry      = True
+        st.position_side      = side
+        # Snapshot features for ML training log — read by risk_manager after fill
+        st.last_entry_features = {**feats, "ev": ev, "side": side, "entry_price": entry_px}
 
         logger.info(
             "[EV] ENTRY: %s  side=%s  ask=%.4f  p_model=%.4f  ev=%.5f",
@@ -491,9 +519,9 @@ class EVSignalEngine:
             )
 
         # ── Auto take-profit: exit when EV flips ─────────────────────
-        volume  = st.volume_history[-1] if st.volume_history else None
-        p_model = self._compute_p_model(st, price, best_bid, best_ask, volume)
-        fee     = cfg.ev_fee_rate
+        volume         = st.volume_history[-1] if st.volume_history else None
+        p_model, _     = self._compute_p_model(st, price, best_bid, best_ask, volume)
+        fee            = cfg.ev_fee_rate
 
         if side == "YES":
             current_ev = self._ev_yes(p_model, best_ask, fee)

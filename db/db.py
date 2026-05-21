@@ -177,6 +177,34 @@ class Database:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS ev_feature_log (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id       INTEGER,
+                ticker            TEXT NOT NULL,
+                market_id         INTEGER,
+                side              TEXT NOT NULL,
+                entry_ts          REAL NOT NULL,
+                exit_ts           REAL,
+                entry_price       REAL NOT NULL,
+                exit_price        REAL,
+                base_p            REAL,
+                delta_weight      REAL,
+                delta_atr         REAL,
+                ob_imbalance      REAL,
+                cross_asset_boost REAL,
+                tf_confirm_boost  REAL,
+                volume_boost      REAL,
+                candle_boost      REAL,
+                price_spike_boost REAL,
+                cvd_boost         REAL,
+                p_model           REAL,
+                ev                REAL,
+                exit_reason       TEXT,
+                pnl               REAL,
+                outcome           INTEGER
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS shadow_vol_trades (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker           TEXT NOT NULL,
@@ -377,4 +405,73 @@ class Database:
             "SELECT id, multiplier, entry_price, side FROM shadow_vol_trades"
             " WHERE ticker=? AND exit_price IS NULL",
             (ticker,),
+        )
+
+    # ------------------------------------------------------------------
+    # EV feature log (ML training data)
+    # ------------------------------------------------------------------
+
+    def log_ev_entry(
+        self,
+        ticker: str,
+        market_id: int,
+        position_id: int,
+        side: str,
+        entry_price: float,
+        features: dict,
+    ) -> int:
+        """
+        Record a confirmed trade entry with all 10 EV feature values.
+        Returns the ev_feature_log row id.
+        """
+        import time as _time
+        sql = """
+        INSERT INTO ev_feature_log (
+            position_id, ticker, market_id, side, entry_ts, entry_price,
+            base_p, delta_weight, delta_atr, ob_imbalance,
+            cross_asset_boost, tf_confirm_boost, volume_boost,
+            candle_boost, price_spike_boost, cvd_boost,
+            p_model, ev
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            position_id, ticker, market_id, side, _time.time(), entry_price,
+            features.get("base_p"),
+            features.get("delta_weight"),
+            features.get("delta_atr"),
+            features.get("ob_imbalance"),
+            features.get("cross_asset_boost"),
+            features.get("tf_confirm_boost"),
+            features.get("volume_boost"),
+            features.get("candle_boost"),
+            features.get("price_spike_boost"),
+            features.get("cvd_boost"),
+            features.get("p_model"),
+            features.get("ev"),
+        )
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            if self._postgres:
+                cur.execute("SELECT lastval()")
+                return cur.fetchone()[0]
+            return cur.lastrowid
+
+    def close_ev_log(
+        self,
+        position_id: int,
+        exit_price: float,
+        exit_reason: str,
+        pnl: float,
+    ) -> None:
+        """
+        Update the ev_feature_log row for this position with exit data.
+        outcome = 1 if pnl > 0, else 0 (binary label for ML classifier).
+        """
+        import time as _time
+        outcome = 1 if pnl > 0 else 0
+        self.execute(
+            """UPDATE ev_feature_log
+               SET exit_ts=?, exit_price=?, exit_reason=?, pnl=?, outcome=?
+               WHERE position_id=?""",
+            (_time.time(), exit_price, exit_reason, pnl, outcome, position_id),
         )

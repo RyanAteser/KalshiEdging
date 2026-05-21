@@ -273,6 +273,21 @@ class RiskManager:
             side=kalshi_side,
         )
 
+        # Log feature snapshot for ML training data
+        try:
+            features = self._signal_engine.get_last_features(signal.ticker)
+            if features:
+                self._db.log_ev_entry(
+                    ticker=signal.ticker,
+                    market_id=signal.market_id,
+                    position_id=position_id,
+                    side=kalshi_side,
+                    entry_price=filled_price,
+                    features=features,
+                )
+        except Exception as exc:
+            logger.warning("[%s] EV feature log failed: %s", signal.ticker, exc)
+
         # CRITICAL: Tell poller a position was just opened so it waits out the
         # Kalshi /positions API propagation delay before assuming it's "gone"
         if self._poller is not None:
@@ -386,6 +401,13 @@ class RiskManager:
         self._signal_engine.mark_position_closed(signal.ticker)
         self._local_open_tickers.discard(signal.ticker)   # clear local guard
         self._sizer.record_result(pnl)
+
+        # Close ML training log for this position
+        try:
+            exit_reason = signal.metadata.get("reason", signal.signal_type.value) if signal.metadata else signal.signal_type.value
+            self._db.close_ev_log(pos_id, exit_price, exit_reason, pnl)
+        except Exception as exc:
+            logger.warning("[%s] EV feature log close failed: %s", signal.ticker, exc)
         if self._shadow is not None:
             self._shadow.close_all(signal.ticker, exit_price, "real_exit")
         if self._shadow_vol is not None:

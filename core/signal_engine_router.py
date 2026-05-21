@@ -118,6 +118,14 @@ class SignalEngineRouter:
         if ev:
             ev.mark_cooldown(ticker, duration)
 
+    def get_last_features(self, ticker: str) -> Optional[dict]:
+        """Return ML training feature snapshot from the last entry signal."""
+        with self._lock:
+            ev = self._ev
+        if ev is None:
+            return None
+        return ev.get_last_features(ticker)
+
     def get_position_snapshot(self, ticker: str) -> Optional[dict]:
         with self._lock:
             ev = self._ev
