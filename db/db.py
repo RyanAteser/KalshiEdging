@@ -199,6 +199,8 @@ class Database:
                 cvd_boost         REAL,
                 p_model           REAL,
                 ev                REAL,
+                btc_distance      REAL,
+                time_pressure     REAL,
                 exit_reason       TEXT,
                 pnl               REAL,
                 outcome           INTEGER
@@ -226,6 +228,13 @@ class Database:
 
         for stmt in statements:
             self.execute(stmt.strip())
+
+        # Migrations: add new columns to existing ev_feature_log tables
+        for col in ("btc_distance REAL", "time_pressure REAL"):
+            try:
+                self.execute(f"ALTER TABLE ev_feature_log ADD COLUMN {col}")
+            except Exception:
+                pass  # column already exists
 
         logger.info("Database schema initialized.")
 
@@ -431,8 +440,8 @@ class Database:
             base_p, delta_weight, delta_atr, ob_imbalance,
             cross_asset_boost, tf_confirm_boost, volume_boost,
             candle_boost, price_spike_boost, cvd_boost,
-            p_model, ev
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            p_model, ev, btc_distance, time_pressure
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
             position_id, ticker, market_id, side, _time.time(), entry_price,
@@ -448,6 +457,8 @@ class Database:
             features.get("cvd_boost"),
             features.get("p_model"),
             features.get("ev"),
+            features.get("btc_distance"),
+            features.get("time_pressure"),
         )
         with self._cursor() as cur:
             cur.execute(sql, params)
