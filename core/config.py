@@ -44,6 +44,15 @@ class Config:
 def load_config() -> Config:
     """Load and validate config from environment. Raises on missing required keys."""
 
+    def _validate(cfg: Config) -> None:
+        if cfg.ev_min_exit >= cfg.ev_min_entry:
+            raise ValueError(
+                f"EV_MIN_EXIT ({cfg.ev_min_exit}) must be LOWER than "
+                f"EV_MIN_ENTRY ({cfg.ev_min_entry}). "
+                f"With exit >= entry, every position exits immediately after entry. "
+                f"Set EV_MIN_EXIT to 0.000 or a negative value (e.g. -0.010)."
+            )
+
     def require(key: str) -> str:
         val = os.getenv(key)
         if not val:
@@ -59,7 +68,7 @@ def load_config() -> Config:
     def get_bool(key: str, default: bool) -> bool:
         return os.getenv(key, str(default)).lower() in ("1", "true", "yes")
 
-    return Config(
+    cfg = Config(
         kalshi_api_key_id=require("KALSHI_API_KEY_ID"),
         kalshi_private_key_path=require("KALSHI_PRIVATE_KEY_PATH"),
         database_url=os.getenv("DATABASE_URL", "sqlite:///kalshi_trader.db"),
@@ -78,3 +87,5 @@ def load_config() -> Config:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         paper_trade=get_bool("PAPER_TRADE", True),
     )
+    _validate(cfg)
+    return cfg
