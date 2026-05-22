@@ -48,8 +48,8 @@ class ExecutionEngine:
         Place a limit BUY order.
         kalshi_side="NO" buys NO contracts (bets price goes down).
         """
-        limit_price = best_ask if best_ask is not None else round(price + 0.01, 4)
-        limit_price = max(0.01, min(0.99, limit_price))
+        limit_price = best_ask if best_ask is not None else round(price + 0.01, 2)
+        limit_price = max(0.01, min(0.99, round(limit_price, 2)))
         contracts   = qty if qty is not None else self._config.position_size
 
         if kalshi_side == "NO":
@@ -92,7 +92,8 @@ class ExecutionEngine:
         """
         # Use the caller-provided side-aware price as-is.
         # risk_manager already computed the right price for YES vs NO.
-        limit_price = max(0.01, min(0.99, round(price, 4)))
+        # Round to 2 decimal places — Kalshi only accepts whole-cent prices.
+        limit_price = max(0.01, min(0.99, round(price, 2)))
 
         if kalshi_side == "NO":
             logger.info(
@@ -158,7 +159,8 @@ class ExecutionEngine:
                                    filled_price=None, filled_qty=0,
                                    error="sanity_check: BUY NO yes_price too high")
 
-        price_str  = f"{yes_price:.4f}"
+        yes_price  = round(yes_price, 2)   # Kalshi only accepts whole-cent prices
+        price_str  = f"{yes_price:.2f}"
         count_str  = str(qty)
         action     = Action.BUY if side == Side.BUY else Action.SELL
         ks         = KalshiSide.YES if kalshi_side == "YES" else KalshiSide.NO
