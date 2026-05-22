@@ -166,7 +166,10 @@ class RiskManager:
             logger.error("[%s] Entry skipped: could not fetch balance", signal.ticker)
             return
 
-        qty = self._sizer.get_qty(cash=cash, ask_price=side_ask)
+        qty = min(
+            self._sizer.get_qty(cash=cash, ask_price=side_ask),
+            self._config.position_size,
+        )
         if qty < 1:
             logger.warning(
                 "[%s] Entry skipped: insufficient cash ($%.2f) for 1 %s contract at %.4f  "
@@ -338,10 +341,10 @@ class RiskManager:
         # sell() needs the price of the SIDE being sold.
         if kalshi_side == "NO":
             # NO bid = 1 - YES ask. Use live best_ask for most accurate price.
-            no_bid = round(1.0 - (best_ask or (1.0 - signal.price)), 6)
-            sell_price = max(no_bid * 0.95, 0.01)   # 5% below NO bid as limit
+            no_bid = round(1.0 - (best_ask or (1.0 - signal.price)), 2)
+            sell_price = max(round(no_bid - 0.02, 2), 0.01)   # 2¢ below NO bid, rounded to cent
         else:
-            sell_price = signal.price * 0.95   # 5% below YES price as limit
+            sell_price = max(round(signal.price - 0.02, 2), 0.01)   # 2¢ below YES price, rounded to cent
 
         self._db.insert_signal(
             market_id=signal.market_id,

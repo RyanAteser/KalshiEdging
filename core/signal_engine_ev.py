@@ -2,11 +2,11 @@
 signal_engine_ev.py — EV-based grid filter signal engine.
 
 Strategy:
-  1. Compute p_model from 10 additive market microstructure + cross-asset signals
+  1. Compute p_model from 9 additive market microstructure + cross-asset signals
   2. Calculate EV = p_model × (1/ask - 1) - (1 - p_model) - fee
   3. Enter when EV > MIN_EV and ask is in grid range [GRID_MIN, GRID_MAX]
-  4. Auto-exit when EV drops below MIN_EXIT_EV (edge gone)
-  5. Stop loss at entry_price - FIXED_RISK (hard floor)
+  4. Auto-exit when EV drops below MIN_EXIT_EV (edge gone — sole exit mechanism)
+  No hard stop loss: backtest showed 0% win rate on stop-loss exits.
 
 p_model components (additive, each capped):
   base_p            — market mid price as baseline probability
@@ -570,28 +570,10 @@ class EVSignalEngine:
 
         cfg  = self._config
         side = st.position_side
-        stop = st.stop_price
 
-        # ── Hard stop loss ────────────────────────────────────────────
-        if side == "NO":
-            check_price = round(1.0 - best_ask, 6)
-            should_stop = stop is not None and check_price <= stop
-        else:
-            check_price = best_bid
-            should_stop = stop is not None and best_bid <= stop
-
-        if should_stop:
-            logger.warning(
-                "[EV] STOP LOSS: %s  %s_price=%.4f  stop=%.4f",
-                ticker, "no" if side == "NO" else "yes", check_price, stop,
-            )
-            return Signal(
-                ticker=ticker,
-                market_id=market_id,
-                signal_type=SignalType.STOP_LOSS,
-                price=check_price,
-                metadata={"engine": "ev_grid", "side": side, "entry_price": st.entry_price},
-            )
+        # Hard stop loss removed: backtest showed 0% win rate on stop-loss exits.
+        # EV-flip is the sole protective exit — when cross-asset and CVD signals
+        # move against the position, EV drops below ev_min_exit and we exit.
 
         # ── Auto take-profit: exit when EV flips ─────────────────────
         volume         = st.volume_history[-1] if st.volume_history else None
