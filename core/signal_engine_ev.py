@@ -40,12 +40,14 @@ logger = logging.getLogger(__name__)
 
 FIXED_RISK          = 0.02   # stop = entry_price - FIXED_RISK (stored, not enforced)
 POST_CLOSE_COOLDOWN = 60.0   # seconds to block re-entry after a position closes
+MARKET_OPEN_LOCKOUT = 90.0   # seconds to block entry after a new market is first seen
 ATR_WINDOW          = 14     # ticks for rolling ATR
 MOMENTUM_WINDOW_SHORT = 5      # ticks for short-term tf_confirm
 MOMENTUM_WINDOW_LONG  = 20     # ticks for long-term tf_confirm
 VOL_WINDOW            = 20     # ticks for volume rolling average
 PRICE_SPIKE_WINDOW    = 5      # ticks for spike detection lookback
 OB_IMBALANCE_WINDOW   = 10     # ticks for bid/ask drift rolling window
+MIN_HISTORY_TICKS   = MOMENTUM_WINDOW_SHORT  # must have this many ticks before entering
 
 
 class EVMarketState:
@@ -75,8 +77,9 @@ class EVMarketState:
         self.btc_target:  Optional[float] = None
         self.close_ts:    float = 0.0    # unix timestamp of 15m candle close
 
-        # Cooldown
-        self.cooldown_until: float = 0.0
+        # Cooldown / lockouts
+        self.cooldown_until:    float = 0.0
+        self.market_open_until: float = time.time() + MARKET_OPEN_LOCKOUT
 
         # Simulation time override (backtest only — replaces time.time() in time-sensitive features)
         self.sim_time: Optional[float] = None
@@ -226,7 +229,14 @@ class EVSignalEngine:
             if st.has_position:
                 return None   # hold to expiry — poller handles settlement close
 
-            if st.pending_entry or time.time() < st.cooldown_until:
+            now = time.time()
+            if st.pending_entry or now < st.cooldown_until:
+                return None
+            if now < st.market_open_until:
+                logger.debug(
+                    "[EV] %s open-lockout: %.0fs remaining",
+                    ticker, st.market_open_until - now,
+                )
                 return None
 
             return self._check_entry(st, ticker, market_id, price, best_bid, best_ask)
@@ -272,8 +282,8 @@ class EVSignalEngine:
         tf_confirm_boost  = self._feat_tf_confirm(st, cap=0.015)
         candle_boost      = self._feat_candle(cap=0.01)
         cvd_boost         = self._feat_cvd(cap=0.02)
-        btc_distance      = self._feat_btc_distance(st, cap=0.15)
-        time_pressure     = self._feat_time_pressure(st, btc_distance, cap=0.10)
+        btc_distance      = self._feat_btc_distance(st, cap=0.06)
+        time_pressure     = self._feat_time_pressure(st, btc_distance, cap=0.06)
         # Zeroed out — backtest data showed consistent negative correlation
         # regardless of sign; pure noise on 1m KXBTC15M ticks.
         delta_atr         = 0.0
@@ -503,8 +513,8 @@ class EVSignalEngine:
         if best_ask is None or best_bid is None:
             return None
 
-        # Need minimum 3 ticks — individual features handle their own history guards
-        if len(st.price_history) < 3:
+        # Need minimum history so momentum features have data
+        if len(st.price_history) < MIN_HISTORY_TICKS:
             return None
 
         yes_in_grid = cfg.ev_grid_min <= best_ask <= cfg.ev_grid_max
