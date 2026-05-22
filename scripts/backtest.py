@@ -244,8 +244,35 @@ def fetch_settled_markets(
                    "close_time_ts", "closeTime", "settle_time")
             )
 
+            # Extract BTC strike — floor_strike/cap_strike are direct floats on settled markets
+            btc_target: Optional[float] = None
+            num_strike = _g(m, "floor_strike", "cap_strike")
+            if num_strike is not None:
+                try:
+                    val = float(num_strike)
+                    if 10_000 <= val <= 999_999:   # realistic BTC price range
+                        btc_target = val
+                except (ValueError, TypeError):
+                    pass
+            # Fallback: parse subtitle string (e.g. "Above $104,000")
+            if btc_target is None:
+                subtitle_raw = _g(m, "yes_sub_title", "subtitle")
+                if subtitle_raw is not None:
+                    try:
+                        clean = re.sub(r"[^0-9]", "", str(subtitle_raw))
+                        if clean:
+                            val = float(clean)
+                            if 10_000 <= val <= 999_999:
+                                btc_target = val
+                    except (ValueError, TypeError):
+                        pass
+            # Final fallback: regex on the ticker string itself
+            if btc_target is None:
+                btc_target = extract_btc_target(ticker)
+
             if close_ts and close_ts >= start_ts:
-                markets.append({"ticker": ticker, "close_ts": close_ts})
+                markets.append({"ticker": ticker, "close_ts": close_ts,
+                                "btc_target": btc_target})
 
         if not cursor:
             break
@@ -294,14 +321,14 @@ def fetch_btc_klines(start_ts: int, end_ts: int) -> Dict[int, dict]:
         for c in candles:
             # Coinbase format: [time, low, high, open, close, volume]
             ts    = int(c[0])
-            low_p = float(c[1])
+            low_  = float(c[1])
             high  = float(c[2])
             open_ = float(c[3])
             close = float(c[4])
             vol   = float(c[5])
 
             # Approximate CVD: bullish candle → net buying, bearish → net selling
-            rng        = high - low
+            rng        = high - low_
             direction  = 1.0 if close > open_ else (-1.0 if close < open_ else 0.0)
             body_ratio = abs(close - open_) / (rng + 1e-8)
             cvd_proxy  = direction * min(1.0, body_ratio)
@@ -310,7 +337,7 @@ def fetch_btc_klines(start_ts: int, end_ts: int) -> Dict[int, dict]:
             result[ts] = {
                 "open":      open_,
                 "high":      high,
-                "low":       low_p,
+                "low":       low_,
                 "close":     close,
                 "volume":    vol,
                 "taker_buy": taker_buy,
@@ -342,9 +369,30 @@ def build_15m_candles(btc_klines: Dict[int, dict]) -> Dict[int, MockCandle]:
 
 
 def extract_btc_target(ticker: str) -> Optional[float]:
-    """Parse BTC target price from ticker e.g. KXBTC15M-23OCT0314-T64000 → 64000."""
-    m = re.search(r"-T(\d+(?:\.\d+)?)$", ticker.upper())
-    return float(m.group(1)) if m else None
+    """
+    Parse BTC target price from ticker string.
+    Tries multiple patterns to handle various Kalshi ticker formats:
+      KXBTC15M-23OCT0314-T64000  → 64000
+      KXBTCM15-240531-T104000    → 104000
+      KXBTCM15-240531-104000T    → 104000
+      KXBTCM15-240531-B104000    → 104000 (Below/Above prefix)
+      KXBTCM15-240531-A104000    → 104000
+    """
+    upper = ticker.upper()
+    patterns = [
+        r"-T(\d+(?:\.\d+)?)$",          # trailing -T12345
+        r"-(\d+(?:\.\d+)?)T$",          # trailing -12345T
+        r"-[AB](\d+(?:\.\d+)?)$",       # trailing -A12345 or -B12345
+        r"-T(\d+(?:\.\d+)?)-",          # embedded -T12345-
+        r"[-_](\d{5,7})(?:T|-|$)",      # 5-7 digit price anywhere
+    ]
+    for pat in patterns:
+        hit = re.search(pat, upper)
+        if hit:
+            val = float(hit.group(1))
+            if 1000 <= val <= 999999:   # sanity: BTC price range
+                return val
+    return None
 
 
 def _safe_dollars(val) -> Optional[float]:
@@ -660,6 +708,16 @@ def main() -> None:
                      "Try --days with a smaller value or check your API key.")
         sys.exit(1)
 
+    logger.info("Sample tickers:     %s", [m["ticker"] for m in markets[:8]])
+    logger.info("Sample btc_targets: %s", [m.get("btc_target") for m in markets[:8]])
+
+    no_target = [m["ticker"] for m in markets if not m.get("btc_target")]
+    if no_target:
+        logger.warning(
+            "%d/%d markets have no parseable BTC target; first few: %s",
+            len(no_target), len(markets), no_target[:5],
+        )
+
     # ── Replay ───────────────────────────────────────────────────────
     all_trades: List[BacktestTrade] = []
     skipped = 0
@@ -667,7 +725,7 @@ def main() -> None:
     for i, m in enumerate(markets):
         ticker     = m["ticker"]
         close_ts   = m["close_ts"]
-        btc_target = extract_btc_target(ticker)
+        btc_target = m.get("btc_target")
 
         if not btc_target:
             skipped += 1
