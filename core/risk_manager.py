@@ -166,7 +166,10 @@ class RiskManager:
             logger.error("[%s] Entry skipped: could not fetch balance", signal.ticker)
             return
 
-        qty = self._sizer.get_qty(cash=cash, ask_price=side_ask)
+        qty = min(
+            self._sizer.get_qty(cash=cash, ask_price=side_ask),
+            self._config.position_size,
+        )
         if qty < 1:
             logger.warning(
                 "[%s] Entry skipped: insufficient cash ($%.2f) for 1 %s contract at %.4f  "
