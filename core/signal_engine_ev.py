@@ -268,21 +268,22 @@ class EVSignalEngine:
 
         base_p            = mid
         delta_weight      = self._feat_delta_weight(st, cap=0.03)
-        delta_atr         = self._feat_delta_atr(st, cap=0.02)
         ob_imbalance      = self._feat_ob_imbalance(st, cap=0.02)
         cross_asset_boost = self._feat_cross_asset(cap=0.02)
         tf_confirm_boost  = self._feat_tf_confirm(st, cap=0.015)
-        volume_boost      = self._feat_volume(st, volume, cap=0.01)
         candle_boost      = self._feat_candle(cap=0.01)
-        price_spike_boost = self._feat_spike(st, cap=0.02)
         cvd_boost         = self._feat_cvd(cap=0.02)
-        # BTC 15m specific: strike distance and time-to-close pressure
         btc_distance      = self._feat_btc_distance(st, cap=0.15)
         time_pressure     = self._feat_time_pressure(st, btc_distance, cap=0.10)
+        # Zeroed out — backtest data showed consistent negative correlation
+        # regardless of sign; pure noise on 1m KXBTC15M ticks.
+        delta_atr         = 0.0
+        volume_boost      = 0.0
+        price_spike_boost = 0.0
 
-        p = (base_p + delta_weight + delta_atr + ob_imbalance +
-             cross_asset_boost + tf_confirm_boost + volume_boost +
-             candle_boost + price_spike_boost + cvd_boost +
+        p = (base_p + delta_weight + ob_imbalance +
+             cross_asset_boost + tf_confirm_boost +
+             candle_boost + cvd_boost +
              btc_distance + time_pressure)
         p = max(0.01, min(0.99, p))
 
@@ -303,12 +304,12 @@ class EVSignalEngine:
         }
 
         logger.debug(
-            "[EV] %s p=%.4f base=%.3f Δw=%.4f Δatr=%.4f ob=%.4f "
-            "cross=%.4f tf=%.4f vol=%.4f cndl=%.4f spk=%.4f cvd=%.4f "
+            "[EV] %s p=%.4f base=%.3f Δw=%.4f ob=%.4f "
+            "cross=%.4f tf=%.4f cndl=%.4f cvd=%.4f "
             "btc_dist=%.4f t_press=%.4f",
-            st.ticker, p, base_p, delta_weight, delta_atr, ob_imbalance,
-            cross_asset_boost, tf_confirm_boost, volume_boost,
-            candle_boost, price_spike_boost, cvd_boost,
+            st.ticker, p, base_p, delta_weight, ob_imbalance,
+            cross_asset_boost, tf_confirm_boost,
+            candle_boost, cvd_boost,
             btc_distance, time_pressure,
         )
         return p, features
