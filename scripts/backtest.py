@@ -3,7 +3,7 @@
 backtest.py — EV Grid Filter historical backtest on KXBTC15M markets.
 
 Usage:
-    cd /home/user/KalshiEdging
+    cd /path/to/KalshiEdging
     python scripts/backtest.py
     python scripts/backtest.py --days 14 --min-ev 0.010
     python scripts/backtest.py --days 30 --grid-min 0.55 --grid-max 0.75
@@ -11,16 +11,21 @@ Usage:
 
 Data:
   - Settled KXBTC15M markets + 1m candlestick history from Kalshi API
-  - Binance BTC/USDT 1m klines for CVD, cross-asset, and 15m candle signals
+  - Coinbase Exchange BTC/USD 1m candles (public, no auth, US-accessible)
 
 Limitations:
   - Fills simulated at candle close prices (no intra-candle slippage)
   - time_pressure feature returns 0 for historical markets (close_ts is in the past)
   - 1m resolution only — no sub-minute tick data
+  - CVD approximated from candle body direction (no taker data from Coinbase)
 
 Output:
   - Console summary: trades, win rate, PnL, Sharpe, feature correlations
   - ev_backtest_results.csv: per-trade record for further analysis
+
+Kalshi key errors:
+  - Check KALSHI_PRIVATE_KEY_PATH in .env points to your actual .pem file
+  - On Windows use forward slashes or double backslashes: keys/prod_private_key.pem
 """
 
 from __future__ import annotations
@@ -54,8 +59,8 @@ from core.models import SignalType
 
 logger = logging.getLogger("backtest")
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-BTC_SERIES         = "KXBTC15M"
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+BTC_SERIES           = "KXBTC15M"
 
 
 # ── Config stub ───────────────────────────────────────────────────────────
@@ -249,44 +254,70 @@ def fetch_settled_markets(
     return markets[:max_markets]
 
 
-def fetch_binance_klines(start_ms: int, end_ms: int) -> Dict[int, dict]:
+def fetch_btc_klines(start_ts: int, end_ts: int) -> Dict[int, dict]:
     """
-    Download all Binance BTC/USDT 1m klines for [start_ms, end_ms].
+    Download BTC/USD 1m candles from Coinbase Exchange (public, no auth, US-accessible).
+    Supports 300 candles per request → batches of 5 hours.
     Returns {unix_second_ts: {open, high, low, close, volume, taker_buy}}.
+
+    CVD is approximated from candle body direction since Coinbase doesn't expose
+    taker buy/sell split. taker_buy is reconstructed so MockBinanceFeed.cvd works.
     """
     result: Dict[int, dict] = {}
-    current = start_ms
+    BATCH_SECS = 300 * 60   # 300 one-minute candles per request
+    current    = start_ts
 
-    while current < end_ms:
-        batch_end = min(current + 1_000 * 60_000, end_ms)
+    while current < end_ts:
+        batch_end  = min(current + BATCH_SECS, end_ts)
+        start_iso  = datetime.fromtimestamp(current,   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso    = datetime.fromtimestamp(batch_end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         url = (
-            f"{BINANCE_KLINES_URL}?symbol=BTCUSDT&interval=1m"
-            f"&startTime={current}&endTime={batch_end}&limit=1000"
+            f"{COINBASE_CANDLES_URL}"
+            f"?granularity=60&start={start_iso}&end={end_iso}"
         )
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept":     "application/json",
+                    "User-Agent": "kalshi-backtest/1.0",
+                },
+            )
             with urllib.request.urlopen(req, timeout=15) as resp:
-                klines = json.loads(resp.read())
+                candles = json.loads(resp.read())
         except Exception as exc:
-            logger.warning("Binance klines fetch failed: %s", exc)
-            break
+            logger.warning("Coinbase candles fetch failed: %s", exc)
+            current = batch_end + 1
+            time.sleep(1.0)
+            continue
 
-        if not klines:
-            break
+        for c in candles:
+            # Coinbase format: [time, low, high, open, close, volume]
+            ts    = int(c[0])
+            low_p = float(c[1])
+            high  = float(c[2])
+            open_ = float(c[3])
+            close = float(c[4])
+            vol   = float(c[5])
 
-        for k in klines:
-            ts = k[0] // 1000  # ms → s
+            # Approximate CVD: bullish candle → net buying, bearish → net selling
+            rng        = high - low
+            direction  = 1.0 if close > open_ else (-1.0 if close < open_ else 0.0)
+            body_ratio = abs(close - open_) / (rng + 1e-8)
+            cvd_proxy  = direction * min(1.0, body_ratio)
+            taker_buy  = vol * (0.5 + cvd_proxy * 0.5)  # back-calculate for MockBinanceFeed
+
             result[ts] = {
-                "open":      float(k[1]),
-                "high":      float(k[2]),
-                "low":       float(k[3]),
-                "close":     float(k[4]),
-                "volume":    float(k[5]),
-                "taker_buy": float(k[9]),
+                "open":      open_,
+                "high":      high,
+                "low":       low_p,
+                "close":     close,
+                "volume":    vol,
+                "taker_buy": taker_buy,
             }
 
-        current = klines[-1][0] + 60_000
-        time.sleep(0.05)
+        current = batch_end + 1
+        time.sleep(0.25)   # Coinbase public rate limit: ~10 req/s, be polite
 
     return result
 
@@ -594,18 +625,34 @@ def main() -> None:
     config   = BacktestConfig(args)
     now_ts   = int(time.time())
     start_ts = now_ts - args.days * 86400
-    start_ms = start_ts * 1000
-    end_ms   = now_ts * 1000
 
-    # ── Binance klines ────────────────────────────────────────────────
-    logger.info("Fetching %d days of Binance BTC/USDT 1m klines...", args.days)
-    btc_klines  = fetch_binance_klines(start_ms, end_ms)
+    # ── Coinbase BTC/USD klines ───────────────────────────────────────
+    logger.info("Fetching %d days of Coinbase BTC/USD 1m candles...", args.days)
+    btc_klines  = fetch_btc_klines(start_ts, now_ts)
     candles_15m = build_15m_candles(btc_klines)
-    logger.info("Binance: %d 1m bars, %d 15m candles", len(btc_klines), len(candles_15m))
+    logger.info("Coinbase: %d 1m bars, %d 15m candles", len(btc_klines), len(candles_15m))
+
+    if not btc_klines:
+        logger.warning(
+            "No BTC candles fetched. Check your internet connection.\n"
+            "Proceeding without cross-asset signals (btc_distance/cvd will be 0)."
+        )
 
     # ── Kalshi settled markets ────────────────────────────────────────
     logger.info("Fetching settled KXBTC15M markets (max %d)...", args.max_markets)
-    client  = KalshiClient.from_env()
+    try:
+        client = KalshiClient.from_env()
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error(
+            "Kalshi client failed: %s\n\n"
+            "  Check your .env file:\n"
+            "    KALSHI_API_KEY_ID=<your-key-id>\n"
+            "    KALSHI_PRIVATE_KEY_PATH=keys/prod_private_key.pem\n\n"
+            "  On Windows use forward slashes, not backslashes.\n"
+            "  Make sure the .pem file is a valid RSA private key (not a certificate).",
+            exc,
+        )
+        sys.exit(1)
     markets = fetch_settled_markets(client, start_ts, args.max_markets)
 
     if not markets:
