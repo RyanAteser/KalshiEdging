@@ -5,8 +5,8 @@ Strategy:
   1. Compute p_model from 9 additive market microstructure + cross-asset signals
   2. Calculate EV = p_model × (1/ask - 1) - (1 - p_model) - fee
   3. Enter when EV > MIN_EV and ask is in grid range [GRID_MIN, GRID_MAX]
-  4. Auto-exit when EV drops below MIN_EXIT_EV (edge gone — sole exit mechanism)
-  No hard stop loss: backtest showed 0% win rate on stop-loss exits.
+  4. Hold to expiry — no intra-market exit. The portfolio poller detects
+     settlement (position disappears from Kalshi) and closes engine state.
 
 p_model components (additive, each capped):
   base_p            — market mid price as baseline probability
@@ -38,10 +38,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FIXED_RISK            = 0.02   # stop = entry_price - FIXED_RISK
-MIN_HOLD_TICKS        = 20     # ticks in position before EV-flip exit can trigger
-POST_CLOSE_COOLDOWN   = 60.0   # seconds to wait after any exit before re-arming
-ATR_WINDOW            = 14     # ticks for rolling ATR
+FIXED_RISK          = 0.02   # stop = entry_price - FIXED_RISK (stored, not enforced)
+POST_CLOSE_COOLDOWN = 60.0   # seconds to block re-entry after a position closes
+ATR_WINDOW          = 14     # ticks for rolling ATR
 MOMENTUM_WINDOW_SHORT = 5      # ticks for short-term tf_confirm
 MOMENTUM_WINDOW_LONG  = 20     # ticks for long-term tf_confirm
 VOL_WINDOW            = 20     # ticks for volume rolling average
@@ -64,7 +63,6 @@ class EVMarketState:
         self.stop_price:      Optional[float] = None
         self.position_id:     Optional[int]   = None
         self.pending_entry    = False
-        self.ticks_in_position: int = 0   # incremented each tick while in a position
 
         # Price / bid / ask / volume histories
         self.price_history:  deque = deque(maxlen=MOMENTUM_WINDOW_LONG + 2)
@@ -129,14 +127,13 @@ class EVSignalEngine:
         if st is None:
             return
         with self._lock:
-            st.has_position       = True
-            st.pending_entry      = False
-            st.position_ticker    = ticker
-            st.entry_price        = entry_price
-            st.stop_price         = round(entry_price - FIXED_RISK, 6)
-            st.position_id        = position_id
-            st.position_side      = side or "YES"
-            st.ticks_in_position  = 0
+            st.has_position    = True
+            st.pending_entry   = False
+            st.position_ticker = ticker
+            st.entry_price     = entry_price
+            st.stop_price      = round(entry_price - FIXED_RISK, 6)
+            st.position_id     = position_id
+            st.position_side   = side or "YES"
         logger.info(
             "[EV] IN: %s @ %.4f  stop=%.4f  side=%s  id=%d",
             ticker, entry_price, st.stop_price, st.position_side, position_id,
@@ -147,15 +144,14 @@ class EVSignalEngine:
         if st is None:
             return
         with self._lock:
-            st.has_position       = False
-            st.pending_entry      = False
-            st.position_ticker    = None
-            st.entry_price        = None
-            st.stop_price         = None
-            st.position_id        = None
-            st.position_side      = None
-            st.ticks_in_position  = 0
-            st.cooldown_until     = time.time() + POST_CLOSE_COOLDOWN
+            st.has_position    = False
+            st.pending_entry   = False
+            st.position_ticker = None
+            st.entry_price     = None
+            st.stop_price      = None
+            st.position_id     = None
+            st.position_side   = None
+            st.cooldown_until  = time.time() + POST_CLOSE_COOLDOWN
         logger.info("[EV] CLOSED: %s — cooling down %.0fs", ticker, POST_CLOSE_COOLDOWN)
 
     def update_market_context(
@@ -228,8 +224,7 @@ class EVSignalEngine:
             self._update_history(st, price, best_bid, best_ask, volume)
 
             if st.has_position:
-                st.ticks_in_position += 1
-                return self._check_exit(st, ticker, market_id, price, best_bid, best_ask)
+                return None   # hold to expiry — poller handles settlement close
 
             if st.pending_entry or time.time() < st.cooldown_until:
                 return None
