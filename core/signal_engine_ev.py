@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FIXED_RISK            = 0.02   # stop = entry_price - FIXED_RISK
+MIN_HOLD_TICKS        = 20     # ticks in position before EV-flip exit can trigger
+POST_CLOSE_COOLDOWN   = 60.0   # seconds to wait after any exit before re-arming
 ATR_WINDOW            = 14     # ticks for rolling ATR
 MOMENTUM_WINDOW_SHORT = 5      # ticks for short-term tf_confirm
 MOMENTUM_WINDOW_LONG  = 20     # ticks for long-term tf_confirm
@@ -62,6 +64,7 @@ class EVMarketState:
         self.stop_price:      Optional[float] = None
         self.position_id:     Optional[int]   = None
         self.pending_entry    = False
+        self.ticks_in_position: int = 0   # incremented each tick while in a position
 
         # Price / bid / ask / volume histories
         self.price_history:  deque = deque(maxlen=MOMENTUM_WINDOW_LONG + 2)
@@ -126,13 +129,14 @@ class EVSignalEngine:
         if st is None:
             return
         with self._lock:
-            st.has_position    = True
-            st.pending_entry   = False
-            st.position_ticker = ticker
-            st.entry_price     = entry_price
-            st.stop_price      = round(entry_price - FIXED_RISK, 6)
-            st.position_id     = position_id
-            st.position_side   = side or "YES"
+            st.has_position       = True
+            st.pending_entry      = False
+            st.position_ticker    = ticker
+            st.entry_price        = entry_price
+            st.stop_price         = round(entry_price - FIXED_RISK, 6)
+            st.position_id        = position_id
+            st.position_side      = side or "YES"
+            st.ticks_in_position  = 0
         logger.info(
             "[EV] IN: %s @ %.4f  stop=%.4f  side=%s  id=%d",
             ticker, entry_price, st.stop_price, st.position_side, position_id,
@@ -143,14 +147,16 @@ class EVSignalEngine:
         if st is None:
             return
         with self._lock:
-            st.has_position    = False
-            st.pending_entry   = False
-            st.position_ticker = None
-            st.entry_price     = None
-            st.stop_price      = None
-            st.position_id     = None
-            st.position_side   = None
-        logger.info("[EV] CLOSED: %s — re-armed", ticker)
+            st.has_position       = False
+            st.pending_entry      = False
+            st.position_ticker    = None
+            st.entry_price        = None
+            st.stop_price         = None
+            st.position_id        = None
+            st.position_side      = None
+            st.ticks_in_position  = 0
+            st.cooldown_until     = time.time() + POST_CLOSE_COOLDOWN
+        logger.info("[EV] CLOSED: %s — cooling down %.0fs", ticker, POST_CLOSE_COOLDOWN)
 
     def update_market_context(
         self, ticker: str, btc_target: Optional[float], close_ts: Optional[float]
@@ -222,6 +228,7 @@ class EVSignalEngine:
             self._update_history(st, price, best_bid, best_ask, volume)
 
             if st.has_position:
+                st.ticks_in_position += 1
                 return self._check_exit(st, ticker, market_id, price, best_bid, best_ask)
 
             if st.pending_entry or time.time() < st.cooldown_until:
@@ -565,12 +572,13 @@ class EVSignalEngine:
         if best_bid is None or best_ask is None:
             return None
 
+        # Don't exit within the first MIN_HOLD_TICKS ticks — normal bid/ask spread
+        # movement can drop the buy-EV below the exit threshold on the very next tick.
+        if st.ticks_in_position < MIN_HOLD_TICKS:
+            return None
+
         cfg  = self._config
         side = st.position_side
-
-        # Hard stop loss removed: backtest showed 0% win rate on stop-loss exits.
-        # EV-flip is the sole protective exit — when cross-asset and CVD signals
-        # move against the position, EV drops below ev_min_exit and we exit.
 
         # ── Auto take-profit: exit when EV flips ─────────────────────
         volume         = st.volume_history[-1] if st.volume_history else None
