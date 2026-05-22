@@ -4,7 +4,7 @@ main.py — Entry point for the Kalshi EV Grid Filter trading system.
 Startup sequence:
   1. Load config from environment
   2. Initialize DB + schema
-  3. Start Binance data feeds (spot + futures)
+  3. Start Coinbase spot feed (mid price + CVD)
   4. Start BTC candle feed (Coinbase, for candle_boost)
   5. Wire feeds into EV signal engine via router
   6. Fetch active sports markets from Kalshi
@@ -24,8 +24,7 @@ from dotenv import load_dotenv
 from pykalshi import KalshiClient
 
 from core.btc_feed import BtcFeed
-import core.binance_feed as binance_feed_module
-import core.binance_futures_feed as binance_futures_feed_module
+import core.coinbase_spot_feed as coinbase_spot_feed_module
 from core.config import load_config
 from core.execution_engine import ExecutionEngine
 from core.market_fetcher import fetch_active_sports_markets
@@ -79,16 +78,15 @@ def main() -> None:
     btc_feed.start()
     logger.info("BTC candle feed started (Coinbase 15m)")
 
-    binance_feed         = binance_feed_module.get_instance()
-    binance_futures_feed = binance_futures_feed_module.get_instance()
-    logger.info("Binance spot + futures feeds starting...")
+    coinbase_spot_feed = coinbase_spot_feed_module.get_instance()
+    logger.info("Coinbase spot feed starting...")
 
     # Give feeds a moment to receive first data
     time.sleep(2)
 
     # ── Signal engine ─────────────────────────────────────────────────
     router = SignalEngineRouter(config)
-    router.set_ev_engine(btc_feed, binance_feed, binance_futures_feed)
+    router.set_ev_engine(btc_feed, coinbase_spot_feed)
 
     # ── Execution + risk ──────────────────────────────────────────────
     execution_engine = ExecutionEngine(client, config)
