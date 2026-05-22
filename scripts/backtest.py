@@ -294,14 +294,14 @@ def fetch_btc_klines(start_ts: int, end_ts: int) -> Dict[int, dict]:
         for c in candles:
             # Coinbase format: [time, low, high, open, close, volume]
             ts    = int(c[0])
-            low_p = float(c[1])
+            low_  = float(c[1])
             high  = float(c[2])
             open_ = float(c[3])
             close = float(c[4])
             vol   = float(c[5])
 
             # Approximate CVD: bullish candle → net buying, bearish → net selling
-            rng        = high - low
+            rng        = high - low_
             direction  = 1.0 if close > open_ else (-1.0 if close < open_ else 0.0)
             body_ratio = abs(close - open_) / (rng + 1e-8)
             cvd_proxy  = direction * min(1.0, body_ratio)
@@ -310,7 +310,7 @@ def fetch_btc_klines(start_ts: int, end_ts: int) -> Dict[int, dict]:
             result[ts] = {
                 "open":      open_,
                 "high":      high,
-                "low":       low_p,
+                "low":       low_,
                 "close":     close,
                 "volume":    vol,
                 "taker_buy": taker_buy,
