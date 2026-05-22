@@ -496,8 +496,8 @@ class EVSignalEngine:
         if best_ask is None or best_bid is None:
             return None
 
-        # Need enough history for all momentum features
-        if len(st.price_history) < MOMENTUM_WINDOW_LONG + 1:
+        # Need minimum 3 ticks — individual features handle their own history guards
+        if len(st.price_history) < 3:
             return None
 
         yes_in_grid = cfg.ev_grid_min <= best_ask <= cfg.ev_grid_max
