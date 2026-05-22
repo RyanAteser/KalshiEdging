@@ -13,12 +13,12 @@ p_model components (additive, each capped):
   delta_weight      — N-tick price momentum (direction × magnitude)
   delta_atr         — 1-tick move / ATR: NEGATED (mean-reverting on 1m Kalshi ticks)
   ob_imbalance      — bid/ask drift asymmetry (proxy for book pressure)
-  cross_asset_boost — BTC spot direction (Binance)
+  cross_asset_boost — BTC spot direction (Coinbase)
   tf_confirm_boost  — 5-tick vs 20-tick momentum agreement
   volume_boost      — volume surge: NEGATED (high vol = more noise, fade trend)
   candle_boost      — BTC 15m candle direction (Coinbase)
   price_spike_boost — spike >3¢ in 5 ticks: NEGATED (fade mean-reverting spikes)
-  cvd_boost         — Binance spot CVD (cumulative volume delta)
+  cvd_boost         — Coinbase spot CVD (cumulative volume delta)
 """
 
 from __future__ import annotations
@@ -34,8 +34,7 @@ from core.config import Config
 
 if TYPE_CHECKING:
     from core.btc_feed import BtcFeed
-    from core.binance_feed import BinanceFeed
-    from core.binance_futures_feed import BinanceFuturesFeed
+    from core.coinbase_spot_feed import CoinbaseSpotFeed
 
 logger = logging.getLogger(__name__)
 
@@ -98,16 +97,14 @@ class EVSignalEngine:
         self,
         config: Config,
         btc_feed: "BtcFeed",
-        binance_feed: "BinanceFeed",
-        binance_futures_feed: "BinanceFuturesFeed",
+        coinbase_spot_feed: "CoinbaseSpotFeed",
     ) -> None:
         self._config  = config
         self._btc     = btc_feed
-        self._bfeed   = binance_feed
-        self._bffeed  = binance_futures_feed
+        self._bfeed   = coinbase_spot_feed
         self._lock    = threading.Lock()
         self._states: dict[str, EVMarketState] = {}
-        self._prev_binance_mid: Optional[float] = None
+        self._prev_coinbase_mid: Optional[float] = None
 
     # ── State management ──────────────────────────────────────────────
 
@@ -378,11 +375,11 @@ class EVSignalEngine:
         mid = self._bfeed.mid_price
         if mid is None:
             return 0.0
-        if self._prev_binance_mid is None:
-            self._prev_binance_mid = mid
+        if self._prev_coinbase_mid is None:
+            self._prev_coinbase_mid = mid
             return 0.0
-        delta = mid - self._prev_binance_mid
-        self._prev_binance_mid = mid
+        delta = mid - self._prev_coinbase_mid
+        self._prev_coinbase_mid = mid
         raw = delta / 500.0   # $500 move → full cap
         return max(-cap, min(cap, raw))
 

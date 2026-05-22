@@ -17,8 +17,7 @@ from core.models import Signal
 
 if TYPE_CHECKING:
     from core.btc_feed import BtcFeed
-    from core.binance_feed import BinanceFeed
-    from core.binance_futures_feed import BinanceFuturesFeed
+    from core.coinbase_spot_feed import CoinbaseSpotFeed
     from core.signal_engine_ev import EVSignalEngine
 
 logger = logging.getLogger(__name__)
@@ -41,15 +40,12 @@ class SignalEngineRouter:
     def set_ev_engine(
         self,
         btc_feed: "BtcFeed",
-        binance_feed: "BinanceFeed",
-        binance_futures_feed: "BinanceFuturesFeed",
+        coinbase_spot_feed: "CoinbaseSpotFeed",
     ) -> None:
         """Wire the EV engine once all data feeds are ready."""
         from core.signal_engine_ev import EVSignalEngine
         with self._lock:
-            self._ev = EVSignalEngine(
-                self._config, btc_feed, binance_feed, binance_futures_feed,
-            )
+            self._ev = EVSignalEngine(self._config, btc_feed, coinbase_spot_feed)
         logger.info("EV Grid Filter engine armed")
 
     # ── Backward-compat / BTC 15m context ────────────────────────────
