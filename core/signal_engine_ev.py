@@ -78,6 +78,9 @@ class EVMarketState:
         # Cooldown
         self.cooldown_until: float = 0.0
 
+        # Simulation time override (backtest only — replaces time.time() in time-sensitive features)
+        self.sim_time: Optional[float] = None
+
         # Feature snapshot at last entry signal — used for ML training data logging
         self.last_entry_features: Optional[dict] = None
 
@@ -212,10 +215,13 @@ class EVSignalEngine:
         best_bid: Optional[float],
         best_ask: Optional[float],
         volume: Optional[float] = None,
+        sim_time: Optional[float] = None,
     ) -> Optional[Signal]:
         st = self.get_or_create_state(ticker, market_id)
 
         with self._lock:
+            if sim_time is not None:
+                st.sim_time = sim_time
             self._update_history(st, price, best_bid, best_ask, volume)
 
             if st.has_position:
@@ -470,7 +476,8 @@ class EVSignalEngine:
         """
         if not st.close_ts:
             return 0.0
-        remaining = st.close_ts - time.time()
+        now = st.sim_time if st.sim_time is not None else time.time()
+        remaining = st.close_ts - now
         if remaining <= 0:
             return 0.0
         market_duration = 900.0   # 15 minutes in seconds

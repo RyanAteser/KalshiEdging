@@ -412,6 +412,7 @@ def run_market_backtest(
     btc_klines:     Dict[int, dict],
     candles_15m:    Dict[int, MockCandle],
     config:         BacktestConfig,
+    slippage:       float = 0.005,
 ) -> List[BacktestTrade]:
     """Replay one KXBTC15M market through the EV engine. Returns any trades."""
     trades: List[BacktestTrade] = []
@@ -451,20 +452,22 @@ def run_market_backtest(
         binance_feed.set_time(ts)
         btc_feed.set_time(ts)
 
-        sig = engine.process_tick(ticker, market_id, price, bid, ask, vol)
+        sig = engine.process_tick(ticker, market_id, price, bid, ask, vol, sim_time=float(ts))
         if sig is None:
             continue
 
         if sig.signal_type == SignalType.ENTRY and current_trade is None:
             feats = engine.get_last_features(ticker) or {}
             side  = feats.get("side", "YES")
-            engine.mark_position_open(ticker, market_id, sig.price, side=side)
+            # Apply slippage: we pay more than the quoted ask on entry
+            actual_entry = round(sig.price + slippage, 6)
+            engine.mark_position_open(ticker, market_id, actual_entry, side=side)
             current_trade = BacktestTrade(
                 ticker      = ticker,
                 btc_target  = btc_target,
                 side        = side,
                 entry_ts    = ts,
-                entry_price = sig.price,
+                entry_price = actual_entry,
                 exit_ts     = None,
                 exit_price  = 0.0,
                 exit_reason = "",
@@ -572,7 +575,7 @@ def print_results(trades: List[BacktestTrade], days: int, args) -> None:
     print(f"\n{'='*W}")
     print(f"  BACKTEST  |  {days}d  |  KXBTC15M  |  EV Grid Filter")
     print(f"  grid=[{args.grid_min:.2f},{args.grid_max:.2f}]  min_ev={args.min_ev}  "
-          f"min_exit_ev={args.min_exit_ev}")
+          f"min_exit_ev={args.min_exit_ev}  slip={args.slippage}")
     print(f"{'='*W}")
 
     if not trades:
@@ -586,11 +589,12 @@ def print_results(trades: List[BacktestTrade], days: int, args) -> None:
     total_pnl = sum(pnls)
     avg_pnl   = total_pnl / total
 
-    # Sharpe — annualised, assuming ~96 markets/day as base rate
+    # Sharpe — annualised using actual trade frequency
     if len(pnls) > 1:
         variance = sum((p - avg_pnl) ** 2 for p in pnls) / (len(pnls) - 1)
         std = math.sqrt(variance)
-        sharpe = (avg_pnl / std * math.sqrt(96 * 365)) if std > 1e-10 else 0.0
+        trades_per_year = (total / days) * 365
+        sharpe = (avg_pnl / std * math.sqrt(trades_per_year)) if std > 1e-10 else 0.0
     else:
         sharpe = 0.0
 
@@ -618,24 +622,47 @@ def print_results(trades: List[BacktestTrade], days: int, args) -> None:
         print(f"    {reason:<15}  {len(ps):>4} trades  "
               f"{w / len(ps) * 100:>5.1f}% win  {sum(ps) / len(ps):>+.5f} avg")
 
-    # Feature correlations with outcome
+    # YES / NO breakdown
+    yes_trades = [t for t in trades if t.side == "YES"]
+    no_trades  = [t for t in trades if t.side == "NO"]
+    if yes_trades or no_trades:
+        print(f"\n  Side breakdown:")
+        for label, group in (("YES", yes_trades), ("NO", no_trades)):
+            if group:
+                gw = sum(1 for t in group if t.outcome == 1)
+                print(f"    {label}  {len(group):>4} trades  "
+                      f"{gw / len(group) * 100:>5.1f}% win  "
+                      f"{sum(t.pnl for t in group) / len(group):>+.5f} avg")
+
+    # Feature correlations — direction-signed so YES and NO trades are comparable:
+    # For NO trades, features that predict YES are negated (they predict the opposite outcome).
+    _DIRECTIONAL = frozenset({
+        "btc_distance", "time_pressure", "delta_weight", "delta_atr",
+        "cross_asset_boost", "tf_confirm_boost", "volume_boost",
+        "candle_boost", "price_spike_boost", "cvd_boost", "ob_imbalance",
+    })
+
+    def _signed_val(trade: BacktestTrade, key: str) -> float:
+        v = trade.features.get(key, 0.0)
+        f = float(v) if isinstance(v, (int, float)) and v is not None else 0.0
+        return -f if (trade.side == "NO" and key in _DIRECTIONAL) else f
+
     feat_keys = sorted(
         {k for t in trades for k in t.features}
         - {"p_model", "ev", "side", "entry_price"}
     )
     corrs = []
     for key in feat_keys:
-        vals = [t.features.get(key, 0.0) or 0.0 for t in trades]
+        vals = [_signed_val(t, key) for t in trades]
         outs = [float(t.outcome) for t in trades]
         corr = _pearson(vals, outs)
         corrs.append((abs(corr), key, corr))
 
-    print(f"\n  Feature → outcome correlations (Pearson):")
+    print(f"\n  Feature → outcome correlations (direction-signed, Pearson):")
     for _, key, corr in sorted(corrs, reverse=True):
         stars = "★" * max(0, min(5, int(abs(corr) * 25)))
         print(f"    {key:<24}  {corr:>+.4f}  {stars}")
 
-    print(f"\n  NOTE: time_pressure not simulated (historical markets already closed)")
     print(f"{'='*W}\n")
 
 
@@ -658,6 +685,8 @@ def main() -> None:
                         help="Grid upper price bound")
     parser.add_argument("--fee-rate",     type=float, default=0.007,
                         help="Fee rate for EV formula")
+    parser.add_argument("--slippage",      type=float, default=0.005,
+                        help="One-way fill slippage added to entry price (e.g. 0.005 = 0.5¢)")
     parser.add_argument("--max-markets",  type=int,   default=500,
                         help="Max settled markets to test")
     parser.add_argument("--output",       default="ev_backtest_results.csv",
@@ -763,6 +792,7 @@ def main() -> None:
             btc_klines     = btc_klines,
             candles_15m    = candles_15m,
             config         = config,
+            slippage       = args.slippage,
         )
         all_trades.extend(trades)
         time.sleep(0.12)   # stay well under Kalshi rate limit
