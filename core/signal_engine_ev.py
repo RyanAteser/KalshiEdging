@@ -9,16 +9,16 @@ Strategy:
   5. Stop loss at entry_price - FIXED_RISK (hard floor)
 
 p_model components (additive, each capped):
-  base_p          — market mid price as baseline probability
-  delta_weight    — N-tick price momentum (direction × magnitude)
-  delta_atr       — momentum normalized by rolling ATR
-  ob_imbalance    — bid/ask drift asymmetry (proxy for book pressure)
+  base_p            — market mid price as baseline probability
+  delta_weight      — N-tick price momentum (direction × magnitude)
+  delta_atr         — 1-tick move / ATR: NEGATED (mean-reverting on 1m Kalshi ticks)
+  ob_imbalance      — bid/ask drift asymmetry (proxy for book pressure)
   cross_asset_boost — BTC spot direction (Binance)
   tf_confirm_boost  — 5-tick vs 20-tick momentum agreement
-  volume_boost    — volume vs rolling average
-  candle_boost    — BTC 15m candle direction (Coinbase)
-  price_spike_boost — spike >3¢ in 5 ticks
-  cvd_boost       — Binance spot CVD (cumulative volume delta)
+  volume_boost      — volume surge: NEGATED (high vol = more noise, fade trend)
+  candle_boost      — BTC 15m candle direction (Coinbase)
+  price_spike_boost — spike >3¢ in 5 ticks: NEGATED (fade mean-reverting spikes)
+  cvd_boost         — Binance spot CVD (cumulative volume delta)
 """
 
 from __future__ import annotations
@@ -342,7 +342,7 @@ class EVSignalEngine:
         return max(-cap, min(cap, delta / n))
 
     def _feat_delta_atr(self, st: EVMarketState, cap: float) -> float:
-        """1-tick delta normalized by rolling ATR."""
+        """1-tick delta normalized by rolling ATR — NEGATED: short-term overshoot mean-reverts."""
         hist = list(st.price_history)
         atrs = list(st.atr_history)
         if len(hist) < 2 or len(atrs) < 3:
@@ -351,7 +351,7 @@ class EVSignalEngine:
         atr   = sum(atrs) / len(atrs)
         if atr < 1e-6:
             return 0.0
-        return max(-cap, min(cap, delta / atr * 0.5))
+        return max(-cap, min(cap, -delta / atr * 0.5))
 
     def _feat_ob_imbalance(self, st: EVMarketState, cap: float) -> float:
         """
@@ -401,7 +401,7 @@ class EVSignalEngine:
     def _feat_volume(
         self, st: EVMarketState, volume: Optional[float], cap: float
     ) -> float:
-        """Volume elevation vs rolling average, in trend direction."""
+        """Volume surge vs rolling average — NEGATED: high volume signals noise, fade direction."""
         if volume is None or len(st.volume_history) < 5:
             return 0.0
         avg = sum(st.volume_history) / len(st.volume_history)
@@ -414,7 +414,7 @@ class EVSignalEngine:
         if len(hist) < 2:
             return 0.0
         direction = 1.0 if hist[-1] >= hist[-2] else -1.0
-        return max(-cap, min(cap, direction * min(1.0, ratio - 1.0) * cap))
+        return max(-cap, min(cap, -direction * min(1.0, ratio - 1.0) * cap))
 
     def _feat_candle(self, cap: float) -> float:
         """BTC 15m Coinbase candle: bullish body → positive, bearish → negative."""
@@ -430,7 +430,7 @@ class EVSignalEngine:
         return max(-cap, min(cap, direction * body_ratio * cap))
 
     def _feat_spike(self, st: EVMarketState, cap: float) -> float:
-        """Price spike >3¢ in last 5 ticks: boost in spike direction."""
+        """Price spike >3¢ in last 5 ticks — NEGATED: fade spike direction (mean reversion)."""
         hist = list(st.price_history)
         if len(hist) < PRICE_SPIKE_WINDOW + 1:
             return 0.0
@@ -438,7 +438,7 @@ class EVSignalEngine:
         if abs(delta) < 0.03:
             return 0.0
         direction = 1.0 if delta > 0 else -1.0
-        return max(-cap, min(cap, direction * min(1.0, abs(delta) / 0.05) * cap))
+        return max(-cap, min(cap, -direction * min(1.0, abs(delta) / 0.05) * cap))
 
     def _feat_cvd(self, cap: float) -> float:
         """Binance spot CVD normalized to [-1, 1], scaled by cap."""
