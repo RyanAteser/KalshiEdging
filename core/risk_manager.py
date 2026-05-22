@@ -340,11 +340,10 @@ class RiskManager:
         # For YES positions: signal.price is the YES price.
         # sell() needs the price of the SIDE being sold.
         if kalshi_side == "NO":
-            # NO bid = 1 - YES ask. Use live best_ask for most accurate price.
             no_bid = round(1.0 - (best_ask or (1.0 - signal.price)), 2)
-            sell_price = max(round(no_bid - 0.02, 2), 0.01)   # 2¢ below NO bid, rounded to cent
+            sell_price = max(round(no_bid, 2), 0.01)
         else:
-            sell_price = max(round(signal.price - 0.02, 2), 0.01)   # 2¢ below YES price, rounded to cent
+            sell_price = max(round(signal.price, 2), 0.01)
 
         self._db.insert_signal(
             market_id=signal.market_id,
