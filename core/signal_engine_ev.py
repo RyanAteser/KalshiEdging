@@ -71,6 +71,10 @@ class EVMarketState:
         self.volume_history: deque = deque(maxlen=VOL_WINDOW)
         self.atr_history:    deque = deque(maxlen=ATR_WINDOW)
 
+        # BTC 15m market context — updated each REST snapshot
+        self.btc_target:  Optional[float] = None
+        self.close_ts:    float = 0.0    # unix timestamp of 15m candle close
+
         # Cooldown
         self.cooldown_until: float = 0.0
 
@@ -147,6 +151,19 @@ class EVSignalEngine:
             st.position_id     = None
             st.position_side   = None
         logger.info("[EV] CLOSED: %s — re-armed", ticker)
+
+    def update_market_context(
+        self, ticker: str, btc_target: Optional[float], close_ts: Optional[float]
+    ) -> None:
+        """Set BTC strike price and close timestamp for this market. Called each REST snapshot."""
+        if ticker not in self._states:
+            return
+        st = self._states[ticker]
+        with self._lock:
+            if btc_target:
+                st.btc_target = btc_target
+            if close_ts:
+                st.close_ts = float(close_ts)
 
     def mark_cooldown(self, ticker: str, duration: float = 30.0) -> None:
         st = self._states.get(ticker)
@@ -253,10 +270,14 @@ class EVSignalEngine:
         candle_boost      = self._feat_candle(cap=0.01)
         price_spike_boost = self._feat_spike(st, cap=0.02)
         cvd_boost         = self._feat_cvd(cap=0.02)
+        # BTC 15m specific: strike distance and time-to-close pressure
+        btc_distance      = self._feat_btc_distance(st, cap=0.15)
+        time_pressure     = self._feat_time_pressure(st, btc_distance, cap=0.10)
 
         p = (base_p + delta_weight + delta_atr + ob_imbalance +
              cross_asset_boost + tf_confirm_boost + volume_boost +
-             candle_boost + price_spike_boost + cvd_boost)
+             candle_boost + price_spike_boost + cvd_boost +
+             btc_distance + time_pressure)
         p = max(0.01, min(0.99, p))
 
         features = {
@@ -270,15 +291,19 @@ class EVSignalEngine:
             "candle_boost":      candle_boost,
             "price_spike_boost": price_spike_boost,
             "cvd_boost":         cvd_boost,
+            "btc_distance":      btc_distance,
+            "time_pressure":     time_pressure,
             "p_model":           p,
         }
 
         logger.debug(
             "[EV] %s p=%.4f base=%.3f Δw=%.4f Δatr=%.4f ob=%.4f "
-            "cross=%.4f tf=%.4f vol=%.4f cndl=%.4f spk=%.4f cvd=%.4f",
+            "cross=%.4f tf=%.4f vol=%.4f cndl=%.4f spk=%.4f cvd=%.4f "
+            "btc_dist=%.4f t_press=%.4f",
             st.ticker, p, base_p, delta_weight, delta_atr, ob_imbalance,
             cross_asset_boost, tf_confirm_boost, volume_boost,
             candle_boost, price_spike_boost, cvd_boost,
+            btc_distance, time_pressure,
         )
         return p, features
 
@@ -414,6 +439,48 @@ class EVSignalEngine:
         cvd = self._bfeed.cvd
         return max(-cap, min(cap, cvd * cap))
 
+    def _feat_btc_distance(self, st: EVMarketState, cap: float) -> float:
+        """
+        Primary BTC 15m signal: how far is the current BTC price from the market's
+        strike (target) price?
+
+        Positive = BTC is ABOVE the target → YES outcome is more likely.
+        Negative = BTC is BELOW the target → YES is less likely.
+
+        A 1% distance (e.g. $650 when BTC=$65,000) maps to ±0.05 boost.
+        Cap is intentionally larger than other features — this is the core signal
+        for a binary BTC price prediction market.
+        """
+        btc_price = self._bfeed.mid_price
+        if btc_price is None or not st.btc_target or st.btc_target <= 0:
+            return 0.0
+        distance = (btc_price - st.btc_target) / st.btc_target
+        return max(-cap, min(cap, distance * 5.0))
+
+    def _feat_time_pressure(self, st: EVMarketState, btc_distance: float, cap: float) -> float:
+        """
+        Amplify the btc_distance signal as close time approaches.
+
+        Logic: if BTC is $500 above target with 14 minutes left, there's still
+        time for a reversal — moderate confidence. If there's 2 minutes left and
+        BTC is the same $500 above, the outcome is much more certain.
+
+        time_fraction: 0 = 15 min left (market just opened), 1 = at close
+        boost = btc_distance * time_fraction * scale
+        """
+        if not st.close_ts:
+            return 0.0
+        remaining = st.close_ts - time.time()
+        if remaining <= 0:
+            return 0.0
+        market_duration = 900.0   # 15 minutes in seconds
+        time_fraction = max(0.0, 1.0 - (remaining / market_duration))
+        # Only add pressure signal in last 50% of the window (after 7.5 min)
+        if time_fraction < 0.5:
+            return 0.0
+        raw = btc_distance * (time_fraction - 0.5) * 2.0 * cap
+        return max(-cap, min(cap, raw))
+
     # ── Entry / exit logic ────────────────────────────────────────────
 
     def _check_entry(
@@ -429,8 +496,8 @@ class EVSignalEngine:
         if best_ask is None or best_bid is None:
             return None
 
-        # Need enough history for all momentum features
-        if len(st.price_history) < MOMENTUM_WINDOW_LONG + 1:
+        # Need minimum 3 ticks — individual features handle their own history guards
+        if len(st.price_history) < 3:
             return None
 
         yes_in_grid = cfg.ev_grid_min <= best_ask <= cfg.ev_grid_max

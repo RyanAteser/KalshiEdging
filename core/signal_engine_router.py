@@ -52,13 +52,17 @@ class SignalEngineRouter:
             )
         logger.info("EV Grid Filter engine armed")
 
-    # ── Backward-compat stubs (called by worker.py, safe no-ops now) ─
+    # ── Backward-compat / BTC 15m context ────────────────────────────
 
     def set_t2t_engine(self, btc_feed: "BtcFeed") -> None:
-        pass
+        pass   # no-op
 
     def update_t2t_context(self, ticker: str, btc_target, close_ts) -> None:
-        pass
+        """Called by worker on each REST snapshot — forward BTC strike + close time to engine."""
+        with self._lock:
+            ev = self._ev
+        if ev:
+            ev.update_market_context(ticker, btc_target, close_ts)
 
     # ── Dashboard label ───────────────────────────────────────────────
 
