@@ -70,7 +70,17 @@ class PositionSizer:
     # ── Public API ────────────────────────────────────────────────────
 
     def get_qty(self, cash: float, ask_price: float) -> int:
-        """Return max contracts that fit in available cash, fees included."""
+        """Return max contracts that fit in available cash, fees included.
+        Returns 0 if the consecutive-loss circuit breaker is active."""
+        with self._lock:
+            if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                logger.warning(
+                    "Sizer: BLOCKED — %d consecutive losses (limit=%d). "
+                    "Restart the bot to reset.",
+                    self._consecutive_losses, MAX_CONSECUTIVE_LOSSES,
+                )
+                return 0
+
         if ask_price <= 0 or cash <= 0:
             return 0
 
@@ -158,31 +168,9 @@ class PositionSizer:
         self._total_trades = len(trades)
         self._total_wins   = sum(1 for p in trades if p > 0)
 
-        temp_wins = 0
-        temp_losses = 0
-        for i, pnl in enumerate(trades):
-            if i == 0:
-                if pnl > 0: temp_wins = 1
-                else:       temp_losses = 1
-            else:
-                if pnl > 0 and temp_wins > 0:
-                    temp_wins += 1
-                elif pnl <= 0 and temp_losses > 0:
-                    temp_losses += 1
-                else:
-                    break
-
-        self._consecutive_wins   = temp_wins
-        self._consecutive_losses = temp_losses
-
-        if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.warning(
-                "PositionSizer: loaded %d consecutive losses — SHUTDOWN MODE ACTIVE",
-                self._consecutive_losses,
-            )
-
+        # Consecutive streaks are session-only — don't carry forward losses
+        # from a previous (possibly broken) run into a fresh session.
         logger.info(
-            "PositionSizer: loaded wins=%d/%d | Current Streak: %dW or %dL",
+            "PositionSizer: loaded wins=%d/%d (streak resets each session)",
             self._total_wins, self._total_trades,
-            self._consecutive_wins, self._consecutive_losses,
         )
