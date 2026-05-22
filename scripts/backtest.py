@@ -413,6 +413,7 @@ def run_market_backtest(
     candles_15m:    Dict[int, MockCandle],
     config:         BacktestConfig,
     slippage:       float = 0.005,
+    hold_mode:      str   = "normal",   # "normal" | "no_stop_loss" | "hold_to_expiry"
 ) -> List[BacktestTrade]:
     """Replay one KXBTC15M market through the EV engine. Returns any trades."""
     trades: List[BacktestTrade] = []
@@ -478,14 +479,19 @@ def run_market_backtest(
             )
 
         elif sig.signal_type in (SignalType.EXIT, SignalType.STOP_LOSS) and current_trade:
-            reason = (
-                "stop_loss" if sig.signal_type == SignalType.STOP_LOSS
-                else (sig.metadata or {}).get("reason", "ev_flip")
+            suppress = (
+                (sig.signal_type == SignalType.STOP_LOSS and hold_mode in ("no_stop_loss", "hold_to_expiry"))
+                or (sig.signal_type == SignalType.EXIT    and hold_mode == "hold_to_expiry")
             )
-            _close_trade(current_trade, sig.price, ts, reason)
-            trades.append(current_trade)
-            current_trade = None
-            engine.mark_position_closed(ticker)
+            if not suppress:
+                reason = (
+                    "stop_loss" if sig.signal_type == SignalType.STOP_LOSS
+                    else (sig.metadata or {}).get("reason", "ev_flip")
+                )
+                _close_trade(current_trade, sig.price, ts, reason)
+                trades.append(current_trade)
+                current_trade = None
+                engine.mark_position_closed(ticker)
 
     # ── Handle position still open at market close (settlement) ──────────
     if current_trade:
@@ -571,11 +577,17 @@ def write_csv(trades: List[BacktestTrade], path: str) -> None:
 
 
 def print_results(trades: List[BacktestTrade], days: int, args) -> None:
-    W = 56
+    hold_mode = (
+        "hold_to_expiry" if getattr(args, "hold_to_expiry", False)
+        else "no_stop_loss" if getattr(args, "no_stop_loss", False)
+        else "normal"
+    )
+    W = 60
     print(f"\n{'='*W}")
     print(f"  BACKTEST  |  {days}d  |  KXBTC15M  |  EV Grid Filter")
     print(f"  grid=[{args.grid_min:.2f},{args.grid_max:.2f}]  min_ev={args.min_ev}  "
           f"min_exit_ev={args.min_exit_ev}  slip={args.slippage}")
+    print(f"  exit_mode={hold_mode}")
     print(f"{'='*W}")
 
     if not trades:
@@ -685,8 +697,12 @@ def main() -> None:
                         help="Grid upper price bound")
     parser.add_argument("--fee-rate",     type=float, default=0.007,
                         help="Fee rate for EV formula")
-    parser.add_argument("--slippage",      type=float, default=0.005,
+    parser.add_argument("--slippage",        type=float, default=0.005,
                         help="One-way fill slippage added to entry price (e.g. 0.005 = 0.5¢)")
+    parser.add_argument("--no-stop-loss",   action="store_true",
+                        help="Suppress stop-loss exits; hold until EV-flip or settlement")
+    parser.add_argument("--hold-to-expiry", action="store_true",
+                        help="Hold all positions to settlement (ignore stop-loss AND EV-flip exits)")
     parser.add_argument("--max-markets",  type=int,   default=500,
                         help="Max settled markets to test")
     parser.add_argument("--output",       default="ev_backtest_results.csv",
@@ -784,6 +800,11 @@ def main() -> None:
             skipped += 1
             continue
 
+        hold_mode = (
+            "hold_to_expiry" if args.hold_to_expiry
+            else "no_stop_loss" if args.no_stop_loss
+            else "normal"
+        )
         trades = run_market_backtest(
             ticker         = ticker,
             btc_target     = btc_target,
@@ -793,6 +814,7 @@ def main() -> None:
             candles_15m    = candles_15m,
             config         = config,
             slippage       = args.slippage,
+            hold_mode      = hold_mode,
         )
         all_trades.extend(trades)
         time.sleep(0.12)   # stay well under Kalshi rate limit
