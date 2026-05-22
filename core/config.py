@@ -70,7 +70,7 @@ def load_config() -> Config:
         position_size=get_int("POSITION_SIZE", 1),
         ev_grid_min=get_float("EV_GRID_MIN", 0.50),
         ev_grid_max=get_float("EV_GRID_MAX", 0.80),
-        ev_min_entry=get_float("EV_MIN_ENTRY", 0.005),
+        ev_min_entry=get_float("EV_MIN_ENTRY", 0.025),
         ev_min_exit=get_float("EV_MIN_EXIT", -0.003),
         ev_fee_rate=get_float("EV_FEE_RATE", 0.007),
         max_markets=get_int("MAX_MARKETS", 10),
