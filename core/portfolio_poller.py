@@ -77,11 +77,17 @@ class PortfolioPoller(threading.Thread):
                 self._check()
                 self._error_count = 0
             except Exception as exc:
-                self._error_count += 1
-                logger.warning("Poll failed (%d/%d): %s", self._error_count, MAX_ERRORS, exc)
-                if self._error_count >= MAX_ERRORS:
-                    logger.error("Poller stopping — too many errors")
-                    break
+                msg = str(exc)
+                # 401 is an auth/permissions issue — retrying won't fix it.
+                # Log a warning and back off, but don't count toward fatal limit.
+                if "401" in msg or "authentication" in msg.lower():
+                    logger.warning("Poll auth error (not counting as fatal): %s", exc)
+                else:
+                    self._error_count += 1
+                    logger.warning("Poll failed (%d/%d): %s", self._error_count, MAX_ERRORS, exc)
+                    if self._error_count >= MAX_ERRORS:
+                        logger.error("Poller stopping — too many errors")
+                        break
             self._stop_event.wait(POLL_INTERVAL)
         logger.info("Portfolio poller stopped")
 
