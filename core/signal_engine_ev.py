@@ -580,6 +580,41 @@ class EVSignalEngine:
         if not yes_in_grid and not no_in_grid:
             return None
 
+        # Time window: only enter during the early-edge window (default 180–600s elapsed)
+        if st.close_ts:
+            now_ts = st.sim_time if st.sim_time is not None else time.time()
+            seconds_elapsed = now_ts - (st.close_ts - 900.0)
+            min_sec = cfg.ev_entry_min_seconds
+            max_sec = cfg.ev_entry_max_seconds
+            if min_sec > 0 and seconds_elapsed < min_sec:
+                logger.debug(
+                    "[EV] %s too early: %.0fs elapsed (min %.0fs)",
+                    ticker, seconds_elapsed, min_sec,
+                )
+                return None
+            if max_sec > 0 and seconds_elapsed > max_sec:
+                logger.debug(
+                    "[EV] %s window closed: %.0fs elapsed (max %.0fs)",
+                    ticker, seconds_elapsed, max_sec,
+                )
+                return None
+
+        # Distance filter: BTC must be far enough from strike in the trade direction
+        btc_price = self._bfeed.mid_price
+        min_dist = cfg.ev_min_btc_dist
+        if btc_price and st.btc_target and min_dist > 0:
+            actual_dist = btc_price - st.btc_target   # + = BTC above strike
+            if actual_dist < min_dist:                 # BTC not far enough above → no YES
+                yes_in_grid = False
+            if actual_dist > -min_dist:                # BTC not far enough below → no NO
+                no_in_grid = False
+            if not yes_in_grid and not no_in_grid:
+                logger.debug(
+                    "[EV] %s dist filter: BTC %.0f vs strike %.0f (dist=%.0f, min=%.0f)",
+                    ticker, btc_price, st.btc_target, actual_dist, min_dist,
+                )
+                return None
+
         volume          = st.volume_history[-1] if st.volume_history else None
         p_model, feats  = self._compute_p_model(st, price, best_bid, best_ask, volume)
         fee             = cfg.ev_fee_rate

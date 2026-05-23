@@ -26,11 +26,16 @@ class Config:
     position_size: int
 
     # EV Grid Filter strategy
-    ev_grid_min:  float   # lower price bound for entry (e.g. 0.50)
-    ev_grid_max:  float   # upper price bound for entry (e.g. 0.80)
+    ev_grid_min:  float   # lower price bound for entry (e.g. 0.80)
+    ev_grid_max:  float   # upper price bound for entry (e.g. 0.96)
     ev_min_entry: float   # minimum EV to open a position (e.g. 0.005)
     ev_min_exit:  float   # auto-exit when EV drops below this (e.g. -0.003)
     ev_fee_rate:  float   # Kalshi fee approximation for EV formula (e.g. 0.007)
+
+    # Early-entry distance strategy (backtest-derived: t=180–600s, dist≥$200)
+    ev_min_btc_dist:      float  # min actual $ dist of BTC from strike (0 = disabled)
+    ev_entry_min_seconds: float  # earliest entry (seconds elapsed since market open)
+    ev_entry_max_seconds: float  # latest entry (0 = no limit)
 
     # Concurrency
     max_markets: int             # max simultaneous market workers
@@ -68,11 +73,14 @@ def load_config() -> Config:
         max_spread=get_float("MAX_SPREAD", 0.10),
         min_liquidity_dollars=get_float("MIN_LIQUIDITY_DOLLARS", 5.0),
         position_size=get_int("POSITION_SIZE", 1),
-        ev_grid_min=get_float("EV_GRID_MIN", 0.50),
-        ev_grid_max=get_float("EV_GRID_MAX", 0.80),
+        ev_grid_min=get_float("EV_GRID_MIN", 0.80),
+        ev_grid_max=get_float("EV_GRID_MAX", 0.96),
         ev_min_entry=get_float("EV_MIN_ENTRY", 0.025),
         ev_min_exit=get_float("EV_MIN_EXIT", -0.003),
         ev_fee_rate=get_float("EV_FEE_RATE", 0.007),
+        ev_min_btc_dist=get_float("EV_MIN_BTC_DIST", 200.0),
+        ev_entry_min_seconds=get_float("EV_ENTRY_MIN_SECONDS", 180.0),
+        ev_entry_max_seconds=get_float("EV_ENTRY_MAX_SECONDS", 600.0),
         max_markets=get_int("MAX_MARKETS", 10),
         worker_restart_delay=get_float("WORKER_RESTART_DELAY", 5.0),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
