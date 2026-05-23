@@ -2,23 +2,28 @@
 signal_engine_ev.py — EV-based grid filter signal engine.
 
 Strategy:
-  1. Compute p_model from 9 additive market microstructure + cross-asset signals
+  1. Compute p_model — via ML model if available, else hand-crafted formula
   2. Calculate EV = p_model × (1/ask - 1) - (1 - p_model) - fee
   3. Enter when EV > MIN_EV and ask is in grid range [GRID_MIN, GRID_MAX]
   4. Hold to expiry — no intra-market exit. The portfolio poller detects
      settlement (position disappears from Kalshi) and closes engine state.
 
-p_model components (additive, each capped):
+ML model (preferred):
+  Trained on 8 days of Polymarket BTC 15m order book data.
+  Input: first 5-min microprice/OB-imbalance/depth snapshot features.
+  Output: calibrated P(Up) used directly as p_model.
+  Falls back to hand-crafted formula if ml/btc_15m_model.pkl not found.
+
+Hand-crafted p_model components (additive, each capped):
   base_p            — market mid price as baseline probability
   delta_weight      — N-tick price momentum (direction × magnitude)
-  delta_atr         — 1-tick move / ATR: NEGATED (mean-reverting on 1m Kalshi ticks)
   ob_imbalance      — bid/ask drift asymmetry (proxy for book pressure)
   cross_asset_boost — BTC spot direction (Coinbase)
   tf_confirm_boost  — 5-tick vs 20-tick momentum agreement
-  volume_boost      — volume surge: NEGATED (high vol = more noise, fade trend)
   candle_boost      — BTC 15m candle direction (Coinbase)
-  price_spike_boost — spike >3¢ in 5 ticks: NEGATED (fade mean-reverting spikes)
   cvd_boost         — Coinbase spot CVD (cumulative volume delta)
+  btc_distance      — BTC price vs market strike price
+  time_pressure     — amplifies btc_distance in last 7.5 min
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import logging
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from core.models import Signal, SignalType
@@ -38,16 +44,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FIXED_RISK          = 0.02   # stop = entry_price - FIXED_RISK (stored, not enforced)
-POST_CLOSE_COOLDOWN = 60.0   # seconds to block re-entry after a position closes
-MARKET_OPEN_LOCKOUT = 90.0   # seconds to block entry after a new market is first seen
-ATR_WINDOW          = 14     # ticks for rolling ATR
-MOMENTUM_WINDOW_SHORT = 5      # ticks for short-term tf_confirm
-MOMENTUM_WINDOW_LONG  = 20     # ticks for long-term tf_confirm
-VOL_WINDOW            = 20     # ticks for volume rolling average
-PRICE_SPIKE_WINDOW    = 5      # ticks for spike detection lookback
-OB_IMBALANCE_WINDOW   = 10     # ticks for bid/ask drift rolling window
-MIN_HISTORY_TICKS   = MOMENTUM_WINDOW_SHORT  # must have this many ticks before entering
+FIXED_RISK            = 0.02
+POST_CLOSE_COOLDOWN   = 60.0
+MARKET_OPEN_LOCKOUT   = 90.0
+ATR_WINDOW            = 14
+MOMENTUM_WINDOW_SHORT = 5
+MOMENTUM_WINDOW_LONG  = 20
+VOL_WINDOW            = 20
+PRICE_SPIKE_WINDOW    = 5
+OB_IMBALANCE_WINDOW   = 10
+MIN_HISTORY_TICKS     = MOMENTUM_WINDOW_SHORT
+
+# ── ML model (optional) ───────────────────────────────────────────────────────
+
+_ML_PREDICTOR = None   # singleton, loaded once
+
+def _get_ml_predictor():
+    global _ML_PREDICTOR
+    if _ML_PREDICTOR is not None:
+        return _ML_PREDICTOR
+    model_path = Path(__file__).parent.parent / "ml" / "btc_15m_model.pkl"
+    if not model_path.exists():
+        logger.info("No ML model found at %s — using hand-crafted p_model", model_path)
+        _ML_PREDICTOR = False   # sentinel: don't retry
+        return None
+    try:
+        from ml.predictor import MLPredictor
+        _ML_PREDICTOR = MLPredictor(model_path)
+        logger.info("ML p_model loaded from %s", model_path)
+        return _ML_PREDICTOR
+    except Exception as exc:
+        logger.warning("ML model load failed (%s) — using hand-crafted p_model", exc)
+        _ML_PREDICTOR = False
+        return None
 
 
 class EVMarketState:
@@ -81,11 +110,15 @@ class EVMarketState:
         self.cooldown_until:    float = 0.0
         self.market_open_until: float = time.time() + MARKET_OPEN_LOCKOUT
 
-        # Simulation time override (backtest only — replaces time.time() in time-sensitive features)
+        # Simulation time override (backtest only)
         self.sim_time: Optional[float] = None
 
         # Feature snapshot at last entry signal — used for ML training data logging
         self.last_entry_features: Optional[dict] = None
+
+        # ML accumulator — fed every tick, read at entry time
+        from ml.predictor import MLState
+        self.ml_state: MLState = MLState()
 
 
 class EVSignalEngine:
@@ -262,6 +295,9 @@ class EVSignalEngine:
         if volume is not None and volume > 0:
             st.volume_history.append(volume)
 
+        # Feed ML accumulator every tick
+        st.ml_state.update(best_bid, best_ask)
+
     # ── EV computation ────────────────────────────────────────────────
 
     def _compute_p_model(
@@ -272,9 +308,16 @@ class EVSignalEngine:
         best_ask: Optional[float],
         volume: Optional[float],
     ) -> tuple[float, dict]:
-        """Return (p_model, features_dict). features_dict captured for ML training data."""
+        """
+        Return (p_model, features_dict).
+
+        Uses the trained ML model if available (AUC ~0.82 on held-out test data).
+        Falls back to the hand-crafted additive formula if no model file found.
+        Either way, also computes the hand-crafted features for DB logging.
+        """
         mid = (best_bid + best_ask) / 2.0 if best_bid and best_ask else price
 
+        # ── Hand-crafted features (always computed for logging) ───────────────
         base_p            = mid
         delta_weight      = self._feat_delta_weight(st, cap=0.03)
         ob_imbalance      = self._feat_ob_imbalance(st, cap=0.02)
@@ -284,17 +327,30 @@ class EVSignalEngine:
         cvd_boost         = self._feat_cvd(cap=0.02)
         btc_distance      = self._feat_btc_distance(st, cap=0.06)
         time_pressure     = self._feat_time_pressure(st, btc_distance, cap=0.06)
-        # Zeroed out — backtest data showed consistent negative correlation
-        # regardless of sign; pure noise on 1m KXBTC15M ticks.
         delta_atr         = 0.0
         volume_boost      = 0.0
         price_spike_boost = 0.0
 
-        p = (base_p + delta_weight + ob_imbalance +
-             cross_asset_boost + tf_confirm_boost +
-             candle_boost + cvd_boost +
-             btc_distance + time_pressure)
-        p = max(0.01, min(0.99, p))
+        hc_p = (base_p + delta_weight + ob_imbalance +
+                cross_asset_boost + tf_confirm_boost +
+                candle_boost + cvd_boost +
+                btc_distance + time_pressure)
+        hc_p = max(0.01, min(0.99, hc_p))
+
+        # ── ML model (preferred) ──────────────────────────────────────────────
+        predictor = _get_ml_predictor()
+        if predictor:
+            p = predictor.predict(st.ml_state)
+            logger.debug(
+                "[EV] %s p_ml=%.4f  p_hc=%.4f  base=%.3f Δw=%.4f btc_dist=%.4f",
+                st.ticker, p, hc_p, base_p, delta_weight, btc_distance,
+            )
+        else:
+            p = hc_p
+            logger.debug(
+                "[EV] %s p=%.4f base=%.3f Δw=%.4f ob=%.4f btc_dist=%.4f",
+                st.ticker, p, base_p, delta_weight, ob_imbalance, btc_distance,
+            )
 
         features = {
             "base_p":            base_p,
