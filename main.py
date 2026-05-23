@@ -71,6 +71,7 @@ def main() -> None:
     # ── Database ──────────────────────────────────────────────────────
     db = Database()
     db.create_schema()
+    session_id = db.start_session(config)
 
     # ── Kalshi client ─────────────────────────────────────────────────
     client = KalshiClient.from_env()
@@ -117,7 +118,11 @@ def main() -> None:
     for m in markets:
         ticker    = m["ticker"]
         event     = m.get("event", "")
-        market_id = db.upsert_market(ticker, event)
+        market_id = db.upsert_market(
+            ticker, event,
+            btc_target=m.get("btc_target"),
+            close_ts=float(m.get("close_ts")) if m.get("close_ts") else None,
+        )
 
         worker = MarketWorker(
             client=client,
@@ -167,6 +172,7 @@ def main() -> None:
             w.join(timeout=3.0)
         poller.join(timeout=5.0)
         rotator.join(timeout=5.0)
+        db.end_session(session_id)
         logger.info("Shutdown complete.")
         sys.exit(0)
 

@@ -228,6 +228,7 @@ class RiskManager:
                     entry_price=best_ask,
                     quantity=qty,
                     stop_loss=round((best_ask or signal.price) - 0.02, 6),
+                    side=kalshi_side,
                 )
                 self._signal_engine.mark_position_open(
                     ticker=signal.ticker,
@@ -253,6 +254,9 @@ class RiskManager:
 
         filled_price = result.filled_price or signal.price
 
+        # Fetch features before open_position so we can use them in both calls
+        features = self._signal_engine.get_last_features(signal.ticker)
+
         self._db.insert_trade(
             market_id=signal.market_id,
             side="BUY",
@@ -266,6 +270,9 @@ class RiskManager:
             entry_price=filled_price,
             quantity=result.filled_qty,
             stop_loss=computed_stop,
+            side=kalshi_side,
+            seconds_in_market=features.get("seconds_elapsed") if features else None,
+            tick_count=features.get("tick_count") if features else None,
         )
 
         # Update engine with real position_id now that we have it
@@ -278,15 +285,15 @@ class RiskManager:
 
         # Log feature snapshot for ML training data
         try:
-            features = self._signal_engine.get_last_features(signal.ticker)
             if features:
-                self._db.log_ev_entry(
+                self._db.log_ev_features(
                     ticker=signal.ticker,
                     market_id=signal.market_id,
                     position_id=position_id,
                     side=kalshi_side,
                     entry_price=filled_price,
                     features=features,
+                    btc_price=self._signal_engine.btc_mid_price,
                 )
         except Exception as exc:
             logger.warning("[%s] EV feature log failed: %s", signal.ticker, exc)
@@ -330,9 +337,9 @@ class RiskManager:
             logger.debug("[%s] Exit skipped: no open position", signal.ticker)
             return
 
-        pos_id      = position[0]
-        entry_price = position[2]
-        quantity    = position[3]
+        pos_id      = position["id"]
+        entry_price = position["entry_price"]
+        quantity    = position["quantity"]
 
         kalshi_side = signal.metadata.get("side", "YES") if signal.metadata else "YES"
 
@@ -370,10 +377,10 @@ class RiskManager:
                     "[%s] Sell blocked: market already closed — recording as settlement",
                     signal.ticker,
                 )
-                self._db.close_position(pos_id)
+                pnl = (1.0 - entry_price) * quantity
+                self._db.close_position(pos_id, exit_price=1.0, exit_reason="settlement", pnl=pnl)
                 self._signal_engine.mark_position_closed(signal.ticker)
                 self._local_open_tickers.discard(signal.ticker)
-                pnl = (1.0 - entry_price) * quantity
                 self._sizer.record_result(pnl)
                 if self._shadow is not None:
                     self._shadow.close_all(signal.ticker, 1.0, "settlement")
@@ -392,6 +399,9 @@ class RiskManager:
         # YES: exit > entry = win. NO: exit > entry = win (entry/exit are NO prices).
         pnl = (exit_price - entry_price) * result.filled_qty
 
+        exit_reason = (signal.metadata.get("reason", signal.signal_type.value)
+                       if signal.metadata else signal.signal_type.value)
+
         self._db.insert_trade(
             market_id=signal.market_id,
             side="SELL",
@@ -399,15 +409,14 @@ class RiskManager:
             quantity=result.filled_qty,
             pnl=pnl,
         )
-        self._db.close_position(pos_id)
+        self._db.close_position(pos_id, exit_price=exit_price, exit_reason=exit_reason, pnl=pnl)
         self._signal_engine.mark_position_closed(signal.ticker)
         self._local_open_tickers.discard(signal.ticker)   # clear local guard
         self._sizer.record_result(pnl)
 
         # Close ML training log for this position
         try:
-            exit_reason = signal.metadata.get("reason", signal.signal_type.value) if signal.metadata else signal.signal_type.value
-            self._db.close_ev_log(pos_id, exit_price, exit_reason, pnl)
+            self._db.close_ev_features(pos_id, exit_price, exit_reason, pnl)
         except Exception as exc:
             logger.warning("[%s] EV feature log close failed: %s", signal.ticker, exc)
         if self._shadow is not None:

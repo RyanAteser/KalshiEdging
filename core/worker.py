@@ -217,7 +217,10 @@ class MarketWorker(threading.Thread):
 
     def _on_tick(self, price: float, bid: Optional[float], ask: Optional[float], vol: Optional[float]) -> None:
         try:
-            self._db.insert_tick(self._market_id, bid, ask, price, vol)
+            btc_price = self._signal_engine.btc_mid_price
+            cvd       = self._signal_engine.btc_cvd
+            self._db.insert_tick(self._market_id, bid, ask, price, vol,
+                                 btc_price=btc_price, cvd=cvd)
             sig = self._signal_engine.process_tick(self._ticker, self._market_id, price, bid, ask, vol)
             if sig:
                 self._risk_manager.handle_signal(sig, bid, ask)

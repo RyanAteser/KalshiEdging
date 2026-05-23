@@ -543,7 +543,22 @@ class EVSignalEngine:
         st.pending_entry      = True
         st.position_side      = side
         # Snapshot features for ML training log — read by risk_manager after fill
-        st.last_entry_features = {**feats, "ev": ev, "side": side, "entry_price": entry_px}
+        now_ts = st.sim_time if st.sim_time is not None else time.time()
+        seconds_remaining = max(0.0, st.close_ts - now_ts) if st.close_ts else None
+        seconds_elapsed   = max(0.0, now_ts - (st.close_ts - 900.0)) if st.close_ts else None
+
+        st.last_entry_features = {
+            **feats,
+            "ev": ev,
+            "side": side,
+            "entry_price": entry_px,
+            # New context fields for DB logging
+            "spread": round(best_ask - best_bid, 6),
+            "btc_target": st.btc_target,
+            "seconds_elapsed": seconds_elapsed,
+            "seconds_remaining": seconds_remaining,
+            "tick_count": len(st.price_history),
+        }
 
         logger.info(
             "[EV] ENTRY: %s  side=%s  ask=%.4f  p_model=%.4f  ev=%.5f",
