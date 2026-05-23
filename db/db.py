@@ -346,8 +346,8 @@ class Database:
             except Exception:
                 pass
 
-        # Signals new cols
-        for col in ("side TEXT", "p_model REAL", "ev REAL", "engine TEXT"):
+        # Signals new cols (ts is the unix-float replacement for legacy 'timestamp TEXT')
+        for col in ("ts REAL", "side TEXT", "p_model REAL", "ev REAL", "engine TEXT"):
             try:
                 self.execute(f"ALTER TABLE signals ADD COLUMN {col}")
             except Exception:
@@ -365,6 +365,7 @@ class Database:
             "order_id TEXT",
             "seconds_in_market_at_entry REAL",
             "tick_count_at_entry INTEGER",
+            "source TEXT DEFAULT 'ev_grid'",
         ):
             try:
                 self.execute(f"ALTER TABLE positions ADD COLUMN {col}")
@@ -515,11 +516,25 @@ class Database:
         if metadata and engine is None:
             engine = metadata.get("engine")
 
-        self.execute(
-            """INSERT INTO signals (market_id, ts, signal_type, side, price, p_model, ev, engine)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (market_id, time.time(), signal_type, side, price, p_model, ev, engine),
-        )
+        now = time.time()
+        try:
+            self.execute(
+                """INSERT INTO signals (market_id, ts, signal_type, side, price, p_model, ev, engine)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (market_id, now, signal_type, side, price, p_model, ev, engine),
+            )
+        except Exception as exc:
+            # Legacy databases have 'timestamp TEXT NOT NULL' — include it as fallback
+            if "timestamp" in str(exc).lower() or "not null" in str(exc).lower():
+                self.execute(
+                    """INSERT INTO signals
+                       (market_id, timestamp, ts, signal_type, side, price, p_model, ev, engine)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (market_id, datetime.utcnow().isoformat(), now,
+                     signal_type, side, price, p_model, ev, engine),
+                )
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # Trades
@@ -569,6 +584,7 @@ class Database:
         tick_count: Optional[int] = None,
         order_id: Optional[str] = None,
     ) -> int:
+        now = time.time()
         sql = """
         INSERT INTO positions
             (market_id, side, entry_price, entry_ts, quantity, status, stop_loss,
@@ -576,15 +592,37 @@ class Database:
         VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
         """
         params = (
-            market_id, side, entry_price, time.time(), quantity, stop_loss,
+            market_id, side, entry_price, now, quantity, stop_loss,
             seconds_in_market, tick_count, order_id,
         )
-        with self._cursor() as cur:
-            cur.execute(sql, params)
-            if self._postgres:
-                cur.execute("SELECT lastval()")
-                return cur.fetchone()[0]
-            return cur.lastrowid
+        try:
+            with self._cursor() as cur:
+                cur.execute(sql, params)
+                if self._postgres:
+                    cur.execute("SELECT lastval()")
+                    return cur.fetchone()[0]
+                return cur.lastrowid
+        except Exception as exc:
+            # Legacy databases have 'created_at TEXT NOT NULL' — include it as fallback
+            if "created_at" in str(exc).lower() or "not null" in str(exc).lower():
+                sql_legacy = """
+                INSERT INTO positions
+                    (market_id, side, entry_price, entry_ts, quantity, status, stop_loss,
+                     seconds_in_market_at_entry, tick_count_at_entry, order_id, created_at)
+                VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+                """
+                params_legacy = (
+                    market_id, side, entry_price, now, quantity, stop_loss,
+                    seconds_in_market, tick_count, order_id,
+                    datetime.utcnow().isoformat(),
+                )
+                with self._cursor() as cur:
+                    cur.execute(sql_legacy, params_legacy)
+                    if self._postgres:
+                        cur.execute("SELECT lastval()")
+                        return cur.fetchone()[0]
+                    return cur.lastrowid
+            raise
 
     def close_position(
         self,

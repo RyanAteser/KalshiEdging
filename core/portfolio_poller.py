@@ -138,20 +138,18 @@ class PortfolioPoller(threading.Thread):
 
         try:
             market_id = self._db.get_market_id(ticker)
-            if not market_id:
-                market_id = self._db.upsert_market(ticker, ticker)
+            existing  = self._db.get_open_position(market_id) if market_id else None
 
-            existing = self._db.get_open_position(market_id)
-            if existing:
-                pos_id = existing["id"]
-            else:
-                pos_id = self._db.open_position(
-                    market_id=market_id,
-                    entry_price=entry_px or 0.65,
-                    quantity=qty,
-                    stop_loss=round((entry_px or 0.65) - 0.02, 6),
-                    side=side,
+            if not existing:
+                # No DB record → this position was NOT opened by this bot.
+                # Skip adoption so we don't interfere with another system's trades.
+                logger.info(
+                    "[%s] Orphan has no DB record — likely from another system. Skipping.",
+                    ticker,
                 )
+                return
+
+            pos_id = existing["id"]
 
             # Use the router's public interface to register the orphan
             self._signal_engine.mark_position_open(
