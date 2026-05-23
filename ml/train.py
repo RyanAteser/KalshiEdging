@@ -1,13 +1,15 @@
 """
 ml/train.py — Train XGBoost p_model for BTC 15m prediction markets.
 
-Reads prices zip directly (no extraction needed).
+Reads both prices + orderbook zips directly (no extraction needed).
 Features are computed from the first 5 minutes of each market only —
 no look-ahead. The output model maps real-time order book state → P(Up).
 
 Usage (Windows):
     pip install pandas pyarrow xgboost scikit-learn
-    python ml/train.py --prices "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip"
+    python ml/train.py \
+        --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \
+        --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip"
 
 Output:
     ml/btc_15m_model.pkl  — model artifact (load with pickle)
@@ -29,110 +31,32 @@ from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ENTRY_WINDOW  = 300   # seconds of data to use for features (first 5 min of 15-min market)
-SNAPSHOTS     = [0, 30, 60, 120, 180, 300]   # timestamps to snapshot features at
-MIN_ROWS      = 310   # skip files shorter than this (incomplete markets)
-SETTLED_THRESH = 0.90  # up_bid >= this at end → Up settled; <= 1-this → Down settled
+ENTRY_WINDOW   = 300    # seconds of features to use (first 5 min of 15-min market)
+SNAPSHOTS      = [0, 30, 60, 120, 180, 300]
+MIN_ROWS       = 310    # skip files shorter than this
+SETTLED_THRESH = 0.90   # up_bid >= this → Up settled; <= 1-this → Down settled
 
 
-# ── Feature engineering ───────────────────────────────────────────────────────
+# ── Loading helpers ───────────────────────────────────────────────────────────
 
-def extract_features(df: pd.DataFrame, slug: str, date_str: str) -> dict | None:
+def _slug_from_name(name: str) -> str | None:
+    """Extract market slug from parquet path, or None."""
+    # Try to get it from the data; fall back to filename-based guess
+    return None  # filled after reading
+
+
+def _load_zip_by_slug(zip_path: str, kind: str) -> dict[str, pd.DataFrame]:
     """
-    Given a 900-row prices DataFrame for one market, return a feature dict.
-    Returns None if the market is too short or outcome is ambiguous.
+    Load all parquet files from zip, keyed by market slug.
+    kind = 'prices' or 'orderbook' (for progress logging only).
     """
-    if len(df) < MIN_ROWS:
-        return None
+    by_slug: dict[str, pd.DataFrame] = {}
 
-    # ── Derive label from end of market ──────────────────────────────────────
-    # Up settled → up_bid near 1.0; Down settled → up_bid near 0.0
-    final_up_bid = df["up_bid"].dropna().iloc[-1] if df["up_bid"].dropna().shape[0] else None
-    if final_up_bid is None:
-        return None
-    if final_up_bid >= SETTLED_THRESH:
-        label = 1
-    elif final_up_bid <= (1.0 - SETTLED_THRESH):
-        label = 0
-    else:
-        return None   # market didn't settle cleanly — skip
-
-    window = df.iloc[:ENTRY_WINDOW]
-
-    feat: dict = {"slug": slug, "date": date_str, "label": label}
-
-    # ── Snapshot features at key timestamps ──────────────────────────────────
-    for t in SNAPSHOTS:
-        if t >= len(window):
-            continue
-        row = window.iloc[t]
-        p = f"t{t}"
-        feat[f"{p}_up_micro"]   = row.get("up_microprice")
-        feat[f"{p}_up_obi"]     = row.get("up_ob_imbalance")
-        feat[f"{p}_up_bid"]     = row.get("up_bid")
-        feat[f"{p}_up_ask"]     = row.get("up_ask")
-        feat[f"{p}_depth_ratio"] = (
-            row.get("up_total_depth", 0) / row.get("down_total_depth", 1)
-            if row.get("down_total_depth", 0) > 0 else 1.0
-        )
-
-    # ── Momentum features ─────────────────────────────────────────────────────
-    micro = window["up_microprice"].ffill()
-    obi   = window["up_ob_imbalance"].ffill()
-
-    if len(micro) >= 60:
-        feat["mom_60"]  = float(micro.iloc[59]  - micro.iloc[0])
-        feat["obi_60"]  = float(obi.iloc[:60].mean())
-    if len(micro) >= 120:
-        feat["mom_120"] = float(micro.iloc[119] - micro.iloc[0])
-        feat["obi_120"] = float(obi.iloc[:120].mean())
-    if len(micro) >= 300:
-        feat["mom_300"] = float(micro.iloc[299] - micro.iloc[0])
-        feat["obi_300"] = float(obi.iloc[:300].mean())
-
-    # ── Rolling statistics over window ────────────────────────────────────────
-    feat["micro_mean"]    = float(micro.mean())
-    feat["micro_std"]     = float(micro.std())
-    feat["micro_max"]     = float(micro.max())
-    feat["micro_min"]     = float(micro.min())
-    feat["micro_range"]   = float(micro.max() - micro.min())
-    feat["obi_mean"]      = float(obi.mean())
-    feat["obi_std"]       = float(obi.std())
-    feat["obi_pos_frac"]  = float((obi > 0).mean())   # fraction of seconds with buy pressure
-
-    # ── Depth ratio over window ───────────────────────────────────────────────
-    up_depth   = window["up_total_depth"].ffill()
-    down_depth = window["down_total_depth"].ffill()
-    safe_down  = down_depth.replace(0, np.nan)
-    feat["depth_ratio_mean"] = float((up_depth / safe_down).mean())
-
-    # ── Opening spread ────────────────────────────────────────────────────────
-    opening = df.iloc[0]
-    bid0 = opening.get("up_bid")
-    ask0 = opening.get("up_ask")
-    if bid0 is not None and ask0 is not None and not (np.isnan(bid0) or np.isnan(ask0)):
-        feat["opening_spread"] = float(ask0 - bid0)
-    else:
-        feat["opening_spread"] = 0.02   # default 1-cent spread
-
-    return feat
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
-
-def load_from_zip(zip_path: str) -> pd.DataFrame:
-    records = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         parquet_names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
-        print(f"  {len(parquet_names)} parquet files found in zip")
+        print(f"  [{kind}] {len(parquet_names)} files in zip")
 
         for name in parquet_names:
-            date_str = None
-            for part in name.replace("\\", "/").split("/"):
-                if part.startswith("dt="):
-                    date_str = part[3:]
-                    break
-
             try:
                 with zf.open(name) as f:
                     df = pd.read_parquet(io.BytesIO(f.read()))
@@ -140,27 +64,211 @@ def load_from_zip(zip_path: str) -> pd.DataFrame:
                 print(f"  SKIP {name}: {e}")
                 continue
 
-            slug = df["slug"].iloc[0] if "slug" in df.columns and len(df) > 0 else name
-            feat = extract_features(df, slug, date_str)
-            if feat is not None:
-                records.append(feat)
+            if "slug" not in df.columns or len(df) == 0:
+                continue
 
-    result = pd.DataFrame(records)
-    print(f"  {len(result)} usable markets loaded")
-    return result
+            slug = df["slug"].iloc[0]
+            by_slug[slug] = df
+
+    print(f"  [{kind}] {len(by_slug)} unique markets loaded")
+    return by_slug
+
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+
+def _window(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the first ENTRY_WINDOW rows, sorted by time."""
+    df = df.sort_values("time").reset_index(drop=True)
+    return df.iloc[:ENTRY_WINDOW]
+
+
+def _derive_label(prices_df: pd.DataFrame) -> int | None:
+    """Derive Up/Down label from end of prices market. Returns 1/0/None."""
+    final = prices_df["up_bid"].dropna()
+    if len(final) == 0:
+        return None
+    v = final.iloc[-1]
+    if v >= SETTLED_THRESH:
+        return 1
+    if v <= (1.0 - SETTLED_THRESH):
+        return 0
+    return None
+
+
+def _prices_features(w: pd.DataFrame) -> dict:
+    """Features from the prices (UP/DOWN aggregated) file."""
+    feat: dict = {}
+
+    micro = w["up_microprice"].ffill()
+    obi   = w["up_ob_imbalance"].ffill()
+
+    # Snapshots
+    for t in SNAPSHOTS:
+        idx = min(t, len(w) - 1)
+        p   = f"t{t}"
+        row = w.iloc[idx]
+        feat[f"{p}_up_micro"]    = float(row.get("up_microprice") or 0)
+        feat[f"{p}_up_obi"]      = float(row.get("up_ob_imbalance") or 0)
+        feat[f"{p}_up_bid"]      = float(row.get("up_bid") or 0)
+        feat[f"{p}_up_ask"]      = float(row.get("up_ask") or 0)
+        up_d   = float(row.get("up_total_depth")   or 0)
+        down_d = float(row.get("down_total_depth")  or 1)
+        feat[f"{p}_depth_ratio"] = up_d / (down_d + 1e-9)
+
+    # Momentum
+    n = len(micro)
+    for steps in [60, 120, 300]:
+        if n >= steps:
+            feat[f"mom_{steps}"] = float(micro.iloc[steps - 1] - micro.iloc[0])
+            feat[f"obi_{steps}"] = float(obi.iloc[:steps].mean())
+
+    # Rolling stats
+    feat.update({
+        "micro_mean":   float(micro.mean()),
+        "micro_std":    float(micro.std()),
+        "micro_max":    float(micro.max()),
+        "micro_min":    float(micro.min()),
+        "micro_range":  float(micro.max() - micro.min()),
+        "obi_mean":     float(obi.mean()),
+        "obi_std":      float(obi.std()),
+        "obi_pos_frac": float((obi > 0).mean()),
+    })
+
+    # Depth ratio over window
+    up_d   = w["up_total_depth"].ffill()
+    down_d = w["down_total_depth"].ffill()
+    feat["depth_ratio_mean"] = float((up_d / (down_d + 1e-9)).mean())
+
+    # Opening spread
+    bid0 = w["up_bid"].iloc[0]
+    ask0 = w["up_ask"].iloc[0]
+    feat["opening_spread"] = float(ask0 - bid0) if pd.notna(bid0) and pd.notna(ask0) else 0.02
+
+    return feat
+
+
+def _orderbook_features(w: pd.DataFrame) -> dict:
+    """
+    Features from the full orderbook file.
+
+    Adds signals NOT in the prices file:
+      - top_bid_size / top_ask_size   (immediate execution pressure)
+      - sum_bid_size / sum_ask_size   (total depth imbalance)
+      - n_bids, n_asks                (book width — how many price levels)
+      - spread                        (explicit bid-ask spread)
+    """
+    feat: dict = {}
+
+    # Compute derived series
+    top_ratio  = w["top_bid_size"]  / (w["top_ask_size"]  + 1e-9)
+    sum_ratio  = w["sum_bid_size"]  / (w["sum_ask_size"]  + 1e-9)
+    spread_s   = w["spread"].ffill()
+    n_bid_s    = w["n_bids"].astype(float)
+    n_ask_s    = w["n_asks"].astype(float)
+
+    # Snapshots
+    for t in SNAPSHOTS:
+        idx = min(t, len(w) - 1)
+        p   = f"t{t}"
+        feat[f"{p}_top_ratio"]  = float(top_ratio.iloc[idx])
+        feat[f"{p}_sum_ratio"]  = float(sum_ratio.iloc[idx])
+        feat[f"{p}_spread"]     = float(spread_s.iloc[idx]  if pd.notna(spread_s.iloc[idx]) else 0.02)
+        feat[f"{p}_n_bids"]     = float(n_bid_s.iloc[idx])
+        feat[f"{p}_n_asks"]     = float(n_ask_s.iloc[idx])
+
+    # Rolling stats on top-of-book ratio (most live signal)
+    feat["top_ratio_mean"]   = float(top_ratio.mean())
+    feat["top_ratio_std"]    = float(top_ratio.std())
+    feat["top_ratio_max"]    = float(top_ratio.max())
+    feat["sum_ratio_mean"]   = float(sum_ratio.mean())
+    feat["sum_ratio_std"]    = float(sum_ratio.std())
+    feat["spread_mean"]      = float(spread_s.mean())
+    feat["spread_std"]       = float(spread_s.std())
+
+    # Momentum of top-of-book ratio (is buy pressure growing?)
+    n = len(top_ratio)
+    for steps in [60, 120, 300]:
+        if n >= steps:
+            feat[f"top_ratio_mom_{steps}"] = float(
+                top_ratio.iloc[steps - 1] - top_ratio.iloc[0]
+            )
+
+    return feat
+
+
+def extract_features(
+    slug: str,
+    date_str: str,
+    prices_df: pd.DataFrame,
+    ob_df: pd.DataFrame | None,
+) -> dict | None:
+    """Combine prices + orderbook features for one market."""
+    if len(prices_df) < MIN_ROWS:
+        return None
+
+    label = _derive_label(prices_df)
+    if label is None:
+        return None
+
+    feat: dict = {"slug": slug, "date": date_str, "label": label}
+
+    # ── Prices features ───────────────────────────────────────────────────────
+    pw = _window(prices_df)
+    feat.update(_prices_features(pw))
+
+    # ── Orderbook features (if available) ─────────────────────────────────────
+    if ob_df is not None and len(ob_df) >= MIN_ROWS:
+        # Align the orderbook window to the market start by matching timestamps
+        if "time" in ob_df.columns and "time" in prices_df.columns:
+            market_start = prices_df["time"].min()
+            market_end   = prices_df["time"].max()
+            mask = (ob_df["time"] >= market_start) & (ob_df["time"] <= market_end)
+            aligned = ob_df[mask].sort_values("time").reset_index(drop=True)
+        else:
+            aligned = ob_df.sort_values("time").reset_index(drop=True) if "time" in ob_df.columns else ob_df
+
+        required = {"top_bid_size", "top_ask_size", "sum_bid_size", "sum_ask_size", "n_bids", "n_asks"}
+        if required.issubset(aligned.columns) and len(aligned) >= MIN_ROWS:
+            obw = aligned.iloc[:ENTRY_WINDOW]
+            feat.update(_orderbook_features(obw))
+
+    return feat
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(prices_zip: str, output_dir: str) -> None:
+def train(prices_zip: str, orderbook_zip: str | None, output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nLoading prices from: {prices_zip}")
-    df = load_from_zip(prices_zip)
+    print(f"\nLoading prices from:    {prices_zip}")
+    prices_by_slug = _load_zip_by_slug(prices_zip, "prices")
 
-    label_dist = df["label"].value_counts().to_dict()
-    print(f"Label distribution: Up={label_dist.get(1,0)}  Down={label_dist.get(0,0)}")
+    ob_by_slug: dict[str, pd.DataFrame] = {}
+    if orderbook_zip:
+        print(f"Loading orderbook from: {orderbook_zip}")
+        ob_by_slug = _load_zip_by_slug(orderbook_zip, "orderbook")
+        overlap = len(set(prices_by_slug) & set(ob_by_slug))
+        print(f"  Matched slugs in both datasets: {overlap}")
+
+    # ── Build feature matrix ──────────────────────────────────────────────────
+    records = []
+    for slug, prices_df in prices_by_slug.items():
+        # Extract date from the prices DataFrame time column
+        date_str = None
+        if "time" in prices_df.columns:
+            ts = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
+            date_str = ts.strftime("%Y-%m-%d")
+
+        ob_df = ob_by_slug.get(slug)
+        feat  = extract_features(slug, date_str, prices_df, ob_df)
+        if feat is not None:
+            records.append(feat)
+
+    df = pd.DataFrame(records)
+    ob_count = sum(1 for r in records if any(k.startswith("top_ratio") for k in r))
+    print(f"\n{len(df)} usable markets  ({ob_count} with orderbook features)")
+    print(f"Label distribution: Up={int((df['label']==1).sum())}  Down={int((df['label']==0).sum())}")
 
     if df["label"].nunique() < 2:
         raise RuntimeError("Only one class in data — cannot train classifier")
@@ -168,10 +276,9 @@ def train(prices_zip: str, output_dir: str) -> None:
     # ── Feature columns ───────────────────────────────────────────────────────
     meta_cols    = {"slug", "date", "label"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
-
     df[feature_cols] = df[feature_cols].fillna(0.0)
 
-    # ── Time-based split (never random — prevents look-ahead) ─────────────────
+    # ── Time-based split (NEVER random — would leak future data) ──────────────
     df = df.sort_values("date").reset_index(drop=True)
     dates = sorted(df["date"].dropna().unique())
 
@@ -200,23 +307,19 @@ def train(prices_zip: str, output_dir: str) -> None:
     # ── XGBoost ───────────────────────────────────────────────────────────────
     print("\nTraining XGBoost...")
     model = xgb.XGBClassifier(
-        n_estimators=300,
+        n_estimators=400,
         max_depth=4,
-        learning_rate=0.05,
+        learning_rate=0.04,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=5,
         gamma=1.0,
         eval_metric="logloss",
-        early_stopping_rounds=25,
+        early_stopping_rounds=30,
         random_state=42,
         verbosity=0,
     )
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=50,
-    )
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     print()
@@ -234,11 +337,12 @@ def train(prices_zip: str, output_dir: str) -> None:
         zip(feature_cols, model.feature_importances_),
         key=lambda x: x[1], reverse=True,
     )
-    print("\nTop 10 features:")
-    for feat_name, imp in importance[:10]:
-        print(f"  {feat_name:35s}  {imp:.4f}")
+    print("\nTop 15 features:")
+    for name, imp in importance[:15]:
+        bar = "█" * int(imp * 200)
+        print(f"  {name:40s}  {imp:.4f}  {bar}")
 
-    # ── Save artifacts ────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
     model_path   = out / "btc_15m_model.pkl"
     feature_path = out / "feature_cols.txt"
 
@@ -247,30 +351,22 @@ def train(prices_zip: str, output_dir: str) -> None:
         "feature_cols": feature_cols,
         "entry_window": ENTRY_WINDOW,
         "snapshots":    SNAPSHOTS,
+        "has_orderbook_features": ob_count > 0,
     }
     with open(model_path, "wb") as f:
         pickle.dump(artifact, f)
-
     feature_path.write_text("\n".join(feature_cols))
 
     print(f"\nSaved: {model_path}")
     print(f"Saved: {feature_path}")
-    print("\nDone. Run inference with: from ml.predictor import MLPredictor")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BTC 15m p_model")
-    parser.add_argument(
-        "--prices",
-        required=True,
-        help='Path to prices zip, e.g. "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip"',
-    )
-    parser.add_argument(
-        "--output",
-        default="ml",
-        help="Directory to write model artifacts (default: ml/)",
-    )
+    parser.add_argument("--prices",    required=True,  help="Path to prices zip")
+    parser.add_argument("--orderbook", default=None,   help="Path to orderbook zip (optional but recommended)")
+    parser.add_argument("--output",    default="ml",   help="Output directory (default: ml/)")
     args = parser.parse_args()
-    train(args.prices, args.output)
+    train(args.prices, args.orderbook, args.output)
