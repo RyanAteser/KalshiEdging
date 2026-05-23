@@ -153,7 +153,46 @@ def _ev(win_rate: float, entry_price: float) -> float:
     return win_rate * (1.0 / entry_price - 1.0) - (1.0 - win_rate)
 
 
+def _add_distance_at(df: pd.DataFrame, second: int) -> pd.DataFrame:
+    """
+    Estimate BTC spot at `second` seconds into the market using the concurrent
+    ATM contract (px_{second} closest to 0.50) per date, then compute distance.
+    Adds columns: btc_spot_{second}, distance_{second}.
+    """
+    px_col   = f"px_{second}"
+    spot_col = f"btc_spot_{second}"
+    dist_col = f"distance_{second}"
+
+    if px_col not in df.columns:
+        return df
+
+    has  = df["strike"].notna() & df[px_col].notna() & (df[px_col] > 0)
+    df_s = df[has].copy()
+    if len(df_s) == 0:
+        return df
+
+    def _atm(grp):
+        idx = (grp[px_col] - 0.5).abs().idxmin()
+        return float(grp.loc[idx, "strike"])
+
+    spot_by_date   = df_s.groupby("date").apply(_atm, include_groups=False)
+    df_s[spot_col] = df_s["date"].map(spot_by_date)
+    df_s[dist_col] = (df_s["strike"] - df_s[spot_col]).abs()
+
+    df = df.copy()
+    df[spot_col] = np.nan
+    df[dist_col] = np.nan
+    df.loc[df_s.index, spot_col] = df_s[spot_col]
+    df.loc[df_s.index, dist_col] = df_s[dist_col]
+    return df
+
+
 def _add_distance(df: pd.DataFrame) -> pd.DataFrame:
+    """Legacy: distance at t=0 using open_micro."""
+    return _add_distance_at(df, 0) if "px_0" in df.columns else _add_distance_at_open(df)
+
+
+def _add_distance_at_open(df: pd.DataFrame) -> pd.DataFrame:
     has = df["strike"].notna() & df["open_micro"].notna()
     df_s = df[has].copy()
     if len(df_s) == 0:
@@ -163,7 +202,7 @@ def _add_distance(df: pd.DataFrame) -> pd.DataFrame:
         idx = (grp["open_micro"] - 0.5).abs().idxmin()
         return float(grp.loc[idx, "strike"])
 
-    spot_by_date = df_s.groupby("date").apply(_atm, include_groups=False)
+    spot_by_date   = df_s.groupby("date").apply(_atm, include_groups=False)
     df_s["btc_spot"] = df_s["date"].map(spot_by_date)
     df_s["distance"] = (df_s["strike"] - df_s["btc_spot"]).abs()
     df = df.copy()
@@ -279,6 +318,52 @@ def _print_sweep(df: pd.DataFrame, metric: str = "wr") -> None:
     if best_sec is not None:
         print(f"\n  ★  Best EV cell:  t={best_sec}s  price≥{best_px:.3f}  "
               f"→  win={best_wr:.1%}  EV={best_ev:+.4f}  n={best_n}")
+
+    # ── Distance at entry for each (time, price) combo ────────────────────────
+    has_strike = df["strike"].notna().sum()
+    if has_strike < 50:
+        return
+
+    print(f"\n{'═' * 90}")
+    print("  Distance from BTC spot to strike AT ENTRY  (median $, p25–p75 range)")
+    print("  Computed per entry-time using the concurrent ATM market as BTC spot reference.")
+    print(f"{'─' * 90}")
+    print(f"  {'t(s)':>6}  {'min_px':>8}  {'N':>6}  {'median$':>9}  {'p25–p75':>16}  {'win%':>7}  {'EV':>8}")
+    print(f"{'─' * 90}")
+
+    # Only show the best 2 price thresholds per time to keep it readable
+    highlight_prices = [0.850, 0.875, 0.900, 0.915]
+
+    for sec in seconds:
+        px_col   = f"px_{sec}"
+        dist_col = f"distance_{sec}"
+        if px_col not in df.columns:
+            continue
+
+        # Compute distance at this entry second if not already done
+        if dist_col not in df.columns:
+            df = _add_distance_at(df, sec)
+
+        has_dist = df[dist_col].notna() & (df[dist_col] < 5000)
+
+        for min_px in highlight_prices:
+            mask = (df[px_col] >= min_px) & (df[px_col] < 1.0) & has_dist
+            sub  = df[mask]
+            n    = len(sub)
+            if n < MIN_TRADES:
+                continue
+            d   = sub[dist_col]
+            wr  = float(sub["outcome"].mean())
+            avg = float(sub[px_col].mean())
+            ev  = _ev(wr, avg)
+            star = " ★" if ev > 0 else "  "
+            print(
+                f"  t={sec:>4}  ≥{min_px:.3f}  {n:>6}  "
+                f"${d.median():>7.0f}  "
+                f"${d.quantile(0.25):.0f}–${d.quantile(0.75):.0f}".ljust(18) +
+                f"  {wr:>6.1%}  {ev:>+7.4f}{star}"
+            )
+        print()
 
 
 # ── Single-time detailed analysis ────────────────────────────────────────────
@@ -404,6 +489,11 @@ def backtest(
     if sweep:
         print(f"\nRunning sweep across {len(SWEEP_SECONDS)} entry times × "
               f"{len(SWEEP_PRICES)} price thresholds...")
+        # Pre-compute distance at each sweep second (used in distance breakdown)
+        if df["strike"].notna().sum() >= 50:
+            print("  Computing distance-at-entry for each time point...", flush=True)
+            for sec in SWEEP_SECONDS:
+                df = _add_distance_at(df, sec)
         _print_sweep(df)
     else:
         print(f"\nEntry point: t={entry_second}s  "
