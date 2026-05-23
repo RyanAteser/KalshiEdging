@@ -54,12 +54,13 @@ SETTLED_THRESH = 0.90   # up_bid >= this → Up settled; <= 1-this → Down sett
 
 # ── Loading helpers ───────────────────────────────────────────────────────────
 
-def _load_zip_by_slug(zip_path: str, kind: str) -> dict[str, pd.DataFrame]:
+def _index_zip_by_slug(zip_path: str, kind: str) -> dict[str, str]:
     """
-    Load all parquet files from zip, keyed by market slug.
-    kind = 'prices' or 'orderbook' (for progress logging only).
+    Build a lightweight slug → filename index from a zip.
+    Only reads the 'slug' column from each parquet — never keeps full DataFrames
+    in memory. Peak RAM = one slug-only DataFrame at a time (~1 KB each).
     """
-    by_slug: dict[str, pd.DataFrame] = {}
+    index: dict[str, str] = {}
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         parquet_names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
@@ -68,19 +69,16 @@ def _load_zip_by_slug(zip_path: str, kind: str) -> dict[str, pd.DataFrame]:
         for name in parquet_names:
             try:
                 with zf.open(name) as f:
-                    df = pd.read_parquet(io.BytesIO(f.read()))
-            except Exception as e:
-                print(f"  SKIP {name}: {e}")
+                    # Read only the slug column — avoids loading all numeric data
+                    tiny = pd.read_parquet(io.BytesIO(f.read()), columns=["slug"])
+            except Exception:
                 continue
 
-            if "slug" not in df.columns or len(df) == 0:
-                continue
+            if len(tiny) > 0:
+                index[tiny["slug"].iloc[0]] = name
 
-            slug = df["slug"].iloc[0]
-            by_slug[slug] = df
-
-    print(f"  [{kind}] {len(by_slug)} unique markets loaded")
-    return by_slug
+    print(f"  [{kind}] {len(index)} slugs indexed")
+    return index
 
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -248,47 +246,66 @@ def _process_zip_pair(prices_zip_path: str, ob_zip_path: str | None) -> list[dic
     """
     Process one prices+orderbook zip pair with minimal peak RAM.
 
-    The orderbook zip is loaded into a slug→DataFrame dict (needed for
-    random-access lookup by slug), then the prices zip is streamed one
-    market at a time. Raw DataFrames are freed immediately after feature
-    extraction. Both dicts are freed before returning.
+    Step 1: Index the orderbook zip (slug → filename, reads only 'slug' column).
+            Peak RAM during indexing = one tiny DataFrame at a time.
+    Step 2: Stream through the prices zip one market at a time, reading the
+            matching orderbook file on-demand and freeing it immediately.
+            Peak RAM during processing = 1 prices DataFrame + 1 orderbook DataFrame.
     """
-    ob_by_slug: dict[str, pd.DataFrame] = {}
+    # Build lightweight index: slug → filename (no DataFrames kept)
+    ob_index: dict[str, str] = {}
     if ob_zip_path:
-        print(f"  Loading orderbook: {ob_zip_path}")
-        ob_by_slug = _load_zip_by_slug(ob_zip_path, "orderbook")
+        print(f"  Indexing orderbook: {ob_zip_path}")
+        ob_index = _index_zip_by_slug(ob_zip_path, "orderbook")
 
     records: list[dict] = []
-    print(f"  Streaming prices:  {prices_zip_path}")
-    with zipfile.ZipFile(prices_zip_path, "r") as zf:
-        parquet_names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
-        print(f"  [prices] {len(parquet_names)} files in zip")
+    print(f"  Streaming prices:   {prices_zip_path}")
 
-        for name in parquet_names:
-            try:
-                with zf.open(name) as fh:
-                    prices_df = pd.read_parquet(io.BytesIO(fh.read()))
-            except Exception as e:
-                print(f"  SKIP {name}: {e}")
-                continue
+    # Keep both zips open simultaneously for on-demand orderbook reads
+    ob_zf = zipfile.ZipFile(ob_zip_path, "r") if ob_zip_path else None
+    try:
+        with zipfile.ZipFile(prices_zip_path, "r") as prices_zf:
+            parquet_names = sorted(n for n in prices_zf.namelist() if n.endswith(".parquet"))
+            print(f"  [prices] {len(parquet_names)} files in zip")
 
-            if "slug" not in prices_df.columns or len(prices_df) == 0:
-                continue
+            for name in parquet_names:
+                try:
+                    with prices_zf.open(name) as fh:
+                        prices_df = pd.read_parquet(io.BytesIO(fh.read()))
+                except Exception as e:
+                    print(f"  SKIP {name}: {e}")
+                    continue
 
-            slug     = prices_df["slug"].iloc[0]
-            date_str = None
-            if "time" in prices_df.columns:
-                ts       = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
-                date_str = ts.strftime("%Y-%m-%d")
+                if "slug" not in prices_df.columns or len(prices_df) == 0:
+                    continue
 
-            ob_df = ob_by_slug.get(slug)
-            feat  = extract_features(slug, date_str, prices_df, ob_df)
-            if feat is not None:
-                records.append(feat)
+                slug     = prices_df["slug"].iloc[0]
+                date_str = None
+                if "time" in prices_df.columns:
+                    ts       = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
+                    date_str = ts.strftime("%Y-%m-%d")
 
-            del prices_df   # free immediately — never accumulate raw data
+                # Read matching orderbook file on-demand, free immediately after
+                ob_df = None
+                if ob_zf and slug in ob_index:
+                    try:
+                        with ob_zf.open(ob_index[slug]) as fh:
+                            ob_df = pd.read_parquet(io.BytesIO(fh.read()))
+                    except Exception as e:
+                        print(f"  SKIP ob {slug}: {e}")
+                        ob_df = None
 
-    del ob_by_slug          # free orderbook before loading next pair
+                feat = extract_features(slug, date_str, prices_df, ob_df)
+                if feat is not None:
+                    records.append(feat)
+
+                del prices_df
+                if ob_df is not None:
+                    del ob_df
+    finally:
+        if ob_zf:
+            ob_zf.close()
+
     gc.collect()
     print(f"  [pair] {len(records)} usable markets extracted")
     return records
