@@ -2,14 +2,28 @@
 ml/train.py — Train XGBoost p_model for BTC 15m prediction markets.
 
 Reads both prices + orderbook zips directly (no extraction needed).
+Processes one zip pair at a time to keep peak RAM low (~1 zip in memory).
 Features are computed from the first 5 minutes of each market only —
 no look-ahead. The output model maps real-time order book state → P(Up).
 
 Usage (Windows):
     pip install pandas pyarrow xgboost scikit-learn
-    python ml/train.py \
-        --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \
+
+    # Single pair
+    python ml/train.py ^
+        --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" ^
         --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip"
+
+    # All four pairs (RAM-safe — processed one at a time)
+    python ml/train.py ^
+        --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" ^
+                    "E:\\prices_btc_15m_2026-04-28_2026-05-05.zip" ^
+                    "E:\\prices_btc_15m_2026-05-06_2026-05-12.zip" ^
+                    "E:\\prices_btc_15m_2026-05-13_2026-05-18.zip" ^
+        --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip" ^
+                    "E:\\orderbook_btc_15m_2026-04-28_2026-05-05.zip" ^
+                    "E:\\orderbook_btc_15m_2026-05-06_2026-05-12.zip" ^
+                    "E:\\orderbook_btc_15m_2026-05-13_2026-05-18.zip"
 
 Output:
     ml/btc_15m_model.pkl  — model artifact (load with pickle)
@@ -19,6 +33,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import pickle
 import zipfile
@@ -38,12 +53,6 @@ SETTLED_THRESH = 0.90   # up_bid >= this → Up settled; <= 1-this → Down sett
 
 
 # ── Loading helpers ───────────────────────────────────────────────────────────
-
-def _slug_from_name(name: str) -> str | None:
-    """Extract market slug from parquet path, or None."""
-    # Try to get it from the data; fall back to filename-based guess
-    return None  # filled after reading
-
 
 def _load_zip_by_slug(zip_path: str, kind: str) -> dict[str, pd.DataFrame]:
     """
@@ -154,12 +163,11 @@ def _orderbook_features(w: pd.DataFrame) -> dict:
     Adds signals NOT in the prices file:
       - top_bid_size / top_ask_size   (immediate execution pressure)
       - sum_bid_size / sum_ask_size   (total depth imbalance)
-      - n_bids, n_asks                (book width — how many price levels)
+      - n_bids, n_asks                (book width)
       - spread                        (explicit bid-ask spread)
     """
     feat: dict = {}
 
-    # Compute derived series
     top_ratio  = w["top_bid_size"]  / (w["top_ask_size"]  + 1e-9)
     sum_ratio  = w["sum_bid_size"]  / (w["sum_ask_size"]  + 1e-9)
     spread_s   = w["spread"].ffill()
@@ -172,11 +180,11 @@ def _orderbook_features(w: pd.DataFrame) -> dict:
         p   = f"t{t}"
         feat[f"{p}_top_ratio"]  = float(top_ratio.iloc[idx])
         feat[f"{p}_sum_ratio"]  = float(sum_ratio.iloc[idx])
-        feat[f"{p}_spread"]     = float(spread_s.iloc[idx]  if pd.notna(spread_s.iloc[idx]) else 0.02)
+        feat[f"{p}_spread"]     = float(spread_s.iloc[idx] if pd.notna(spread_s.iloc[idx]) else 0.02)
         feat[f"{p}_n_bids"]     = float(n_bid_s.iloc[idx])
         feat[f"{p}_n_asks"]     = float(n_ask_s.iloc[idx])
 
-    # Rolling stats on top-of-book ratio (most live signal)
+    # Rolling stats on top-of-book ratio
     feat["top_ratio_mean"]   = float(top_ratio.mean())
     feat["top_ratio_std"]    = float(top_ratio.std())
     feat["top_ratio_max"]    = float(top_ratio.max())
@@ -218,11 +226,10 @@ def extract_features(
 
     # ── Orderbook features (if available) ─────────────────────────────────────
     if ob_df is not None and len(ob_df) >= MIN_ROWS:
-        # Align the orderbook window to the market start by matching timestamps
         if "time" in ob_df.columns and "time" in prices_df.columns:
             market_start = prices_df["time"].min()
             market_end   = prices_df["time"].max()
-            mask = (ob_df["time"] >= market_start) & (ob_df["time"] <= market_end)
+            mask    = (ob_df["time"] >= market_start) & (ob_df["time"] <= market_end)
             aligned = ob_df[mask].sort_values("time").reset_index(drop=True)
         else:
             aligned = ob_df.sort_values("time").reset_index(drop=True) if "time" in ob_df.columns else ob_df
@@ -235,49 +242,79 @@ def extract_features(
     return feat
 
 
+# ── Streaming zip-pair processor ──────────────────────────────────────────────
+
+def _process_zip_pair(prices_zip_path: str, ob_zip_path: str | None) -> list[dict]:
+    """
+    Process one prices+orderbook zip pair with minimal peak RAM.
+
+    The orderbook zip is loaded into a slug→DataFrame dict (needed for
+    random-access lookup by slug), then the prices zip is streamed one
+    market at a time. Raw DataFrames are freed immediately after feature
+    extraction. Both dicts are freed before returning.
+    """
+    ob_by_slug: dict[str, pd.DataFrame] = {}
+    if ob_zip_path:
+        print(f"  Loading orderbook: {ob_zip_path}")
+        ob_by_slug = _load_zip_by_slug(ob_zip_path, "orderbook")
+
+    records: list[dict] = []
+    print(f"  Streaming prices:  {prices_zip_path}")
+    with zipfile.ZipFile(prices_zip_path, "r") as zf:
+        parquet_names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
+        print(f"  [prices] {len(parquet_names)} files in zip")
+
+        for name in parquet_names:
+            try:
+                with zf.open(name) as fh:
+                    prices_df = pd.read_parquet(io.BytesIO(fh.read()))
+            except Exception as e:
+                print(f"  SKIP {name}: {e}")
+                continue
+
+            if "slug" not in prices_df.columns or len(prices_df) == 0:
+                continue
+
+            slug     = prices_df["slug"].iloc[0]
+            date_str = None
+            if "time" in prices_df.columns:
+                ts       = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
+                date_str = ts.strftime("%Y-%m-%d")
+
+            ob_df = ob_by_slug.get(slug)
+            feat  = extract_features(slug, date_str, prices_df, ob_df)
+            if feat is not None:
+                records.append(feat)
+
+            del prices_df   # free immediately — never accumulate raw data
+
+    del ob_by_slug          # free orderbook before loading next pair
+    gc.collect()
+    print(f"  [pair] {len(records)} usable markets extracted")
+    return records
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
-
-def _load_many_zips(zip_paths: list[str], kind: str) -> dict[str, pd.DataFrame]:
-    """Load and merge multiple zip files into one slug → DataFrame dict."""
-    combined: dict[str, pd.DataFrame] = {}
-    for path in zip_paths:
-        print(f"  Loading {kind}: {path}")
-        chunk = _load_zip_by_slug(path, kind)
-        combined.update(chunk)   # later zips overwrite on slug collision (shouldn't happen)
-    print(f"  [{kind}] total unique markets across all zips: {len(combined)}")
-    return combined
-
 
 def train(prices_zips: list[str], orderbook_zips: list[str], output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nLoading {len(prices_zips)} prices zip(s)...")
-    prices_by_slug = _load_many_zips(prices_zips, "prices")
+    n_prices = len(prices_zips)
+    n_ob     = len(orderbook_zips)
+    print(f"\nProcessing {n_prices} zip pair(s) — one at a time to keep RAM low...")
 
-    ob_by_slug: dict[str, pd.DataFrame] = {}
-    if orderbook_zips:
-        print(f"\nLoading {len(orderbook_zips)} orderbook zip(s)...")
-        ob_by_slug = _load_many_zips(orderbook_zips, "orderbook")
-        overlap = len(set(prices_by_slug) & set(ob_by_slug))
-        print(f"  Matched slugs in both datasets: {overlap}")
+    all_records: list[dict] = []
+    for i, prices_path in enumerate(prices_zips):
+        ob_path = orderbook_zips[i] if i < n_ob else None
+        print(f"\n── Pair {i + 1}/{n_prices} ──")
+        all_records.extend(_process_zip_pair(prices_path, ob_path))
 
-    # ── Build feature matrix ──────────────────────────────────────────────────
-    records = []
-    for slug, prices_df in prices_by_slug.items():
-        # Extract date from the prices DataFrame time column
-        date_str = None
-        if "time" in prices_df.columns:
-            ts = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
-            date_str = ts.strftime("%Y-%m-%d")
+    df = pd.DataFrame(all_records)
+    del all_records
+    gc.collect()
 
-        ob_df = ob_by_slug.get(slug)
-        feat  = extract_features(slug, date_str, prices_df, ob_df)
-        if feat is not None:
-            records.append(feat)
-
-    df = pd.DataFrame(records)
-    ob_count = sum(1 for r in records if any(k.startswith("top_ratio") for k in r))
+    ob_count = int(df["top_ratio_mean"].notna().sum()) if "top_ratio_mean" in df.columns else 0
     print(f"\n{len(df)} usable markets  ({ob_count} with orderbook features)")
     print(f"Label distribution: Up={int((df['label']==1).sum())}  Down={int((df['label']==0).sum())}")
 
@@ -296,7 +333,7 @@ def train(prices_zips: list[str], orderbook_zips: list[str], output_dir: str) ->
     if len(dates) < 5:
         raise RuntimeError(f"Need at least 5 distinct dates, got {len(dates)}")
 
-    # Use last 3 days as test, 3 days before that as val, rest as train
+    # Last 3 days = test, 3 days before that = val, rest = train
     test_dates  = dates[-3:]
     val_dates   = dates[-6:-3]
     train_dates = dates[:-6]
@@ -382,19 +419,19 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   # Single zip pair
-  python ml/train.py \\
-      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \\
+  python ml/train.py ^
+      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" ^
       --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip"
 
-  # Multiple zips (pass all at once)
-  python ml/train.py \\
-      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \\
-                  "E:\\prices_btc_15m_2026-04-28_2026-05-05.zip" \\
-                  "E:\\prices_btc_15m_2026-05-06_2026-05-12.zip" \\
-                  "E:\\prices_btc_15m_2026-05-13_2026-05-18.zip" \\
-      --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip" \\
-                  "E:\\orderbook_btc_15m_2026-04-28_2026-05-05.zip" \\
-                  "E:\\orderbook_btc_15m_2026-05-06_2026-05-12.zip" \\
+  # All four pairs (RAM-safe — processed one at a time)
+  python ml/train.py ^
+      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" ^
+                  "E:\\prices_btc_15m_2026-04-28_2026-05-05.zip" ^
+                  "E:\\prices_btc_15m_2026-05-06_2026-05-12.zip" ^
+                  "E:\\prices_btc_15m_2026-05-13_2026-05-18.zip" ^
+      --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip" ^
+                  "E:\\orderbook_btc_15m_2026-04-28_2026-05-05.zip" ^
+                  "E:\\orderbook_btc_15m_2026-05-06_2026-05-12.zip" ^
                   "E:\\orderbook_btc_15m_2026-05-13_2026-05-18.zip"
 """,
     )
