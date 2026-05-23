@@ -237,17 +237,28 @@ def extract_features(
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(prices_zip: str, orderbook_zip: str | None, output_dir: str) -> None:
+def _load_many_zips(zip_paths: list[str], kind: str) -> dict[str, pd.DataFrame]:
+    """Load and merge multiple zip files into one slug → DataFrame dict."""
+    combined: dict[str, pd.DataFrame] = {}
+    for path in zip_paths:
+        print(f"  Loading {kind}: {path}")
+        chunk = _load_zip_by_slug(path, kind)
+        combined.update(chunk)   # later zips overwrite on slug collision (shouldn't happen)
+    print(f"  [{kind}] total unique markets across all zips: {len(combined)}")
+    return combined
+
+
+def train(prices_zips: list[str], orderbook_zips: list[str], output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nLoading prices from:    {prices_zip}")
-    prices_by_slug = _load_zip_by_slug(prices_zip, "prices")
+    print(f"\nLoading {len(prices_zips)} prices zip(s)...")
+    prices_by_slug = _load_many_zips(prices_zips, "prices")
 
     ob_by_slug: dict[str, pd.DataFrame] = {}
-    if orderbook_zip:
-        print(f"Loading orderbook from: {orderbook_zip}")
-        ob_by_slug = _load_zip_by_slug(orderbook_zip, "orderbook")
+    if orderbook_zips:
+        print(f"\nLoading {len(orderbook_zips)} orderbook zip(s)...")
+        ob_by_slug = _load_many_zips(orderbook_zips, "orderbook")
         overlap = len(set(prices_by_slug) & set(ob_by_slug))
         print(f"  Matched slugs in both datasets: {overlap}")
 
@@ -282,20 +293,21 @@ def train(prices_zip: str, orderbook_zip: str | None, output_dir: str) -> None:
     df = df.sort_values("date").reset_index(drop=True)
     dates = sorted(df["date"].dropna().unique())
 
-    if len(dates) < 3:
-        raise RuntimeError(f"Need at least 3 distinct dates, got {len(dates)}")
+    if len(dates) < 5:
+        raise RuntimeError(f"Need at least 5 distinct dates, got {len(dates)}")
 
-    train_dates = dates[:-2]
-    val_date    = dates[-2]
-    test_date   = dates[-1]
+    # Use last 3 days as test, 3 days before that as val, rest as train
+    test_dates  = dates[-3:]
+    val_dates   = dates[-6:-3]
+    train_dates = dates[:-6]
 
     train_df = df[df["date"].isin(train_dates)]
-    val_df   = df[df["date"] == val_date]
-    test_df  = df[df["date"] == test_date]
+    val_df   = df[df["date"].isin(val_dates)]
+    test_df  = df[df["date"].isin(test_dates)]
 
     print(f"\nTrain: {len(train_df)} markets  ({train_dates[0]} → {train_dates[-1]})")
-    print(f"Val:   {len(val_df)} markets  ({val_date})")
-    print(f"Test:  {len(test_df)} markets  ({test_date})")
+    print(f"Val:   {len(val_df)} markets  ({val_dates[0]} → {val_dates[-1]})")
+    print(f"Test:  {len(test_df)} markets  ({test_dates[0]} → {test_dates[-1]})")
 
     X_train = train_df[feature_cols].values
     y_train = train_df["label"].values
@@ -364,9 +376,36 @@ def train(prices_zip: str, orderbook_zip: str | None, output_dir: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train BTC 15m p_model")
-    parser.add_argument("--prices",    required=True,  help="Path to prices zip")
-    parser.add_argument("--orderbook", default=None,   help="Path to orderbook zip (optional but recommended)")
-    parser.add_argument("--output",    default="ml",   help="Output directory (default: ml/)")
+    parser = argparse.ArgumentParser(
+        description="Train BTC 15m p_model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single zip pair
+  python ml/train.py \\
+      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \\
+      --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip"
+
+  # Multiple zips (pass all at once)
+  python ml/train.py \\
+      --prices    "E:\\prices_btc_15m_2026-04-20_2026-04-27.zip" \\
+                  "E:\\prices_btc_15m_2026-04-28_2026-05-05.zip" \\
+                  "E:\\prices_btc_15m_2026-05-06_2026-05-12.zip" \\
+                  "E:\\prices_btc_15m_2026-05-13_2026-05-18.zip" \\
+      --orderbook "E:\\orderbook_btc_15m_2026-04-20_2026-04-27.zip" \\
+                  "E:\\orderbook_btc_15m_2026-04-28_2026-05-05.zip" \\
+                  "E:\\orderbook_btc_15m_2026-05-06_2026-05-12.zip" \\
+                  "E:\\orderbook_btc_15m_2026-05-13_2026-05-18.zip"
+""",
+    )
+    parser.add_argument(
+        "--prices", required=True, nargs="+",
+        help="One or more paths to prices zip files",
+    )
+    parser.add_argument(
+        "--orderbook", default=None, nargs="+",
+        help="One or more paths to orderbook zip files (optional but recommended)",
+    )
+    parser.add_argument("--output", default="ml", help="Output directory (default: ml/)")
     args = parser.parse_args()
-    train(args.prices, args.orderbook, args.output)
+    train(args.prices, args.orderbook or [], args.output)
