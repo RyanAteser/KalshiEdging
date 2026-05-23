@@ -117,11 +117,28 @@ def _make_kalshi(api_key: str | None):
     return pmxt.Kalshi()
 
 
+def _with_retry(fn, label: str = "", max_attempts: int = 6):
+    """Call fn(), retrying with exponential backoff on 429 / rate-limit errors."""
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "rate" in msg or "too many" in msg:
+                wait = min(2 ** attempt, 60)
+                print(f"    rate-limited{' (' + label + ')' if label else ''} — waiting {wait}s …")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"Gave up after {max_attempts} retries ({label})")
+
+
 def _fetch_all_markets(kalshi, days: int | None) -> list:
     """Page through all closed KXBTC15M markets."""
     cutoff = None
+    now    = datetime.now(timezone.utc)
     if days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = now - timedelta(days=days)
 
     markets = []
     cursor  = None
@@ -129,31 +146,37 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
 
     while True:
         params: dict = {
-            "query":  "KXBTC15M",
-            "status": "closed",
-            "limit":  1000,
+            "query": "KXBTC15M",
+            "limit": 200,   # smaller pages — Kalshi rate-limits large scans
         }
         if cursor:
             params["cursor"] = cursor
 
-        result = kalshi.fetch_markets_paginated(params)
-        batch  = result.data
-        page  += 1
+        result = _with_retry(
+            lambda: kalshi.fetch_markets_paginated(params),
+            label=f"page {page+1}",
+        )
+        batch = result.data
+        page += 1
 
         for mkt in batch:
-            if cutoff and mkt.resolution_date and mkt.resolution_date < cutoff:
+            if mkt.resolution_date is None:
                 continue
-            # Must have an up/down outcome (BTC above/below = YES/NO binary)
+            if mkt.resolution_date > now:
+                continue   # not yet settled
+            if cutoff and mkt.resolution_date < cutoff:
+                continue
             outcome = mkt.up or mkt.yes
             if outcome is None:
                 continue
             markets.append(mkt)
 
-        print(f"  page {page}: {len(batch)} markets (total so far: {len(markets)})")
+        print(f"  page {page}: {len(batch)} fetched, {len(markets)} settled kept so far")
 
         if not result.next_cursor or len(batch) == 0:
             break
         cursor = result.next_cursor
+        time.sleep(1.5)   # respect Kalshi's rate limit between pages
 
     return markets
 
@@ -189,50 +212,39 @@ def _sample_market(kalshi, mkt, entry_seconds: list[int], btc_vol: float, rate_d
     slug      = outcome_id
     date_str  = close_dt.strftime("%Y-%m-%d")
 
-    # ── Settle outcome: orderbook snapshot 5s before close ───────────────────
+    # ── Single range call: covers entry window + settlement in one request ──────
     try:
-        settle_ob = kalshi.fetch_order_book(
-            outcome_id,
-            params={"since": close_ms - 10_000, "until": close_ms, "limit": 1},
+        all_books = _with_retry(
+            lambda: kalshi.fetch_order_book(
+                outcome_id,
+                params={"since": open_ms, "until": close_ms, "limit": 1000},
+            ),
+            label=outcome_id,
         )
-        if isinstance(settle_ob, list):
-            settle_ob = settle_ob[-1] if settle_ob else None
-        settle_bid = _best_bid(settle_ob)
-        if settle_bid is None:
-            return []
-        if settle_bid >= SETTLED_THRESH:
-            outcome_val = 1
-        elif settle_bid <= (1.0 - SETTLED_THRESH):
-            outcome_val = 0
-        else:
-            return []
+        if not isinstance(all_books, list):
+            all_books = [all_books] if all_books else []
     except Exception as e:
-        print(f"    settle error {outcome_id}: {e}", file=sys.stderr)
+        print(f"    fetch error {outcome_id}: {e}", file=sys.stderr)
         return []
 
     time.sleep(rate_delay)
 
-    # ── Entry snapshots: one range call covering all entry times ─────────────
-    max_entry   = max(entry_seconds)
-    range_until = open_ms + (max_entry + 60) * 1000  # a bit past the last entry
-
-    try:
-        books = kalshi.fetch_order_book(
-            outcome_id,
-            params={"since": open_ms, "until": range_until, "limit": 1000},
-        )
-        if not isinstance(books, list):
-            books = [books] if books else []
-    except Exception as e:
-        print(f"    entry error {outcome_id}: {e}", file=sys.stderr)
+    if not all_books:
         return []
 
-    time.sleep(rate_delay)
-
-    if not books:
+    # Settlement: use last snapshot in range
+    settle_ob  = all_books[-1]
+    settle_bid = _best_bid(settle_ob)
+    if settle_bid is None:
+        return []
+    if settle_bid >= SETTLED_THRESH:
+        outcome_val = 1
+    elif settle_bid <= (1.0 - SETTLED_THRESH):
+        outcome_val = 0
+    else:
         return []
 
-    # Build a ts→book index for quick lookup
+    books   = all_books
     ts_list = [b.timestamp for b in books if b.timestamp is not None]
     if not ts_list:
         return []
