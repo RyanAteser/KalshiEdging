@@ -141,9 +141,6 @@ class Database:
             )
             """,
             """
-            CREATE INDEX IF NOT EXISTS idx_ticks_market_ts ON ticks(market_id, ts)
-            """,
-            """
             CREATE TABLE IF NOT EXISTS signals (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_id   INTEGER NOT NULL REFERENCES markets(id),
@@ -342,8 +339,8 @@ class Database:
             except Exception:
                 pass  # column already exists
 
-        # Ticks new cols
-        for col in ("spread REAL", "mid REAL", "btc_price REAL", "cvd REAL"):
+        # Ticks new cols (ts is the new unix-float column; old tables had 'timestamp TEXT')
+        for col in ("ts REAL", "spread REAL", "mid REAL", "btc_price REAL", "cvd REAL"):
             try:
                 self.execute(f"ALTER TABLE ticks ADD COLUMN {col}")
             except Exception:
@@ -387,6 +384,14 @@ class Database:
                 self.execute(f"ALTER TABLE ev_feature_log ADD COLUMN {col}")
             except Exception:
                 pass
+
+        # Index on ticks.ts — only valid once the ts column exists
+        try:
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ticks_market_ts ON ticks(market_id, ts)"
+            )
+        except Exception:
+            pass  # ts column not yet present on very old databases
 
         logger.info("Database schema initialized.")
 
