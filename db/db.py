@@ -457,19 +457,36 @@ class Database:
         btc_price: Optional[float] = None,
         cvd: Optional[float] = None,
     ) -> None:
+        now    = time.time()
         spread = None
         mid    = None
         if best_bid is not None and best_ask is not None:
             spread = round(best_ask - best_bid, 6)
             mid    = (best_ask + best_bid) / 2.0
 
-        self.execute(
-            """INSERT INTO ticks
-               (market_id, ts, best_bid, best_ask, last_price, volume, spread, mid, btc_price, cvd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (market_id, time.time(), best_bid, best_ask, last_price, volume,
-             spread, mid, btc_price, cvd),
-        )
+        try:
+            self.execute(
+                """INSERT INTO ticks
+                   (market_id, ts, best_bid, best_ask, last_price, volume, spread, mid, btc_price, cvd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (market_id, now, best_bid, best_ask, last_price, volume,
+                 spread, mid, btc_price, cvd),
+            )
+        except Exception as exc:
+            # Legacy databases have 'timestamp TEXT NOT NULL' — include it as fallback
+            if "timestamp" in str(exc).lower() or "not null" in str(exc).lower():
+                from datetime import datetime as _dt
+                self.execute(
+                    """INSERT INTO ticks
+                       (market_id, timestamp, ts, best_bid, best_ask, last_price, volume,
+                        spread, mid, btc_price, cvd)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (market_id, _dt.utcnow().isoformat(), now,
+                     best_bid, best_ask, last_price, volume,
+                     spread, mid, btc_price, cvd),
+                )
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # Signals
