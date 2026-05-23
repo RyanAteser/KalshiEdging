@@ -372,8 +372,8 @@ class Database:
             except Exception:
                 pass
 
-        # Trades new cols
-        for col in ("position_id INTEGER", "kalshi_side TEXT", "order_id TEXT"):
+        # Trades new cols (ts is the new unix-float column; old tables had 'timestamp TEXT')
+        for col in ("ts REAL", "position_id INTEGER", "kalshi_side TEXT", "order_id TEXT"):
             try:
                 self.execute(f"ALTER TABLE trades ADD COLUMN {col}")
             except Exception:
@@ -552,18 +552,38 @@ class Database:
         kalshi_side: Optional[str] = None,
         order_id: Optional[str] = None,
     ) -> int:
-        with self._cursor() as cur:
-            cur.execute(
-                """INSERT INTO trades
-                   (market_id, position_id, side, kalshi_side, price, quantity, ts, pnl, order_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (market_id, position_id, side, kalshi_side, price, quantity,
-                 time.time(), pnl, order_id),
-            )
-            if self._postgres:
-                cur.execute("SELECT lastval()")
-                return cur.fetchone()[0]
-            return cur.lastrowid
+        now = time.time()
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    """INSERT INTO trades
+                       (market_id, position_id, side, kalshi_side, price, quantity, ts, pnl, order_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (market_id, position_id, side, kalshi_side, price, quantity,
+                     now, pnl, order_id),
+                )
+                if self._postgres:
+                    cur.execute("SELECT lastval()")
+                    return cur.fetchone()[0]
+                return cur.lastrowid
+        except Exception as exc:
+            # Legacy databases have 'timestamp TEXT NOT NULL' — include it as fallback
+            if "timestamp" in str(exc).lower() or "not null" in str(exc).lower():
+                with self._cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO trades
+                           (market_id, timestamp, position_id, side, kalshi_side,
+                            price, quantity, ts, pnl, order_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (market_id, datetime.utcnow().isoformat(),
+                         position_id, side, kalshi_side, price, quantity,
+                         now, pnl, order_id),
+                    )
+                    if self._postgres:
+                        cur.execute("SELECT lastval()")
+                        return cur.fetchone()[0]
+                    return cur.lastrowid
+            raise
 
     def update_trade_pnl(self, trade_id: int, pnl: float) -> None:
         self.execute("UPDATE trades SET pnl = ? WHERE id = ?", (pnl, trade_id))
