@@ -76,9 +76,9 @@ MARKET_DURATION  = 900          # 15-min market = 900 seconds
 MIN_TRADES       = 10
 SECS_PER_YEAR    = 365.25 * 24 * 3600
 
-SWEEP_SECONDS    = [0, 60, 180, 300, 420, 540, 600, 660, 720, 750, 810, 870]
-SWEEP_PRICES     = [0.80, 0.85, 0.875, 0.90, 0.915, 0.93, 0.945, 0.96]
-SWEEP_DISTANCES  = [50, 100, 150, 200, 250, 300, 400, 500]   # implied $ from strike
+SWEEP_SECONDS    = [30, 60, 90, 120, 150, 180, 300, 420, 540, 600, 660, 720, 750, 810, 870]
+SWEEP_PRICES     = [0.75, 0.80, 0.85, 0.875, 0.90, 0.915, 0.93, 0.945, 0.96]
+SWEEP_DISTANCES  = [50, 100, 150, 200, 250, 300, 400, 500, 750, 1000]  # implied $ from strike
 
 
 # ── Implied distance ──────────────────────────────────────────────────────────
