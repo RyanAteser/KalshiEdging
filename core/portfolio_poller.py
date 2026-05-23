@@ -143,13 +143,14 @@ class PortfolioPoller(threading.Thread):
 
             existing = self._db.get_open_position(market_id)
             if existing:
-                pos_id = existing[0]
+                pos_id = existing["id"]
             else:
                 pos_id = self._db.open_position(
                     market_id=market_id,
                     entry_price=entry_px or 0.65,
                     quantity=qty,
                     stop_loss=round((entry_px or 0.65) - 0.02, 6),
+                    side=side,
                 )
 
             # Use the router's public interface to register the orphan
@@ -186,11 +187,13 @@ class PortfolioPoller(threading.Thread):
             if not position:
                 return
 
-            pos_id, _, entry_price, qty = position[0], position[1], position[2], position[3]
-            self._db.close_position(pos_id)
+            pos_id      = position["id"]
+            entry_price = position["entry_price"]
+            qty         = position["quantity"]
 
             # Settled = win ($1 payout)
             pnl = (1.0 - entry_price) * qty
+            self._db.close_position(pos_id, exit_price=1.0, exit_reason="settlement", pnl=pnl)
             if self._sizer:
                 self._sizer.record_result(pnl)
             if self._shadow is not None:

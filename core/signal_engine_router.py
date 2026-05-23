@@ -70,6 +70,24 @@ class SignalEngineRouter:
     def active_label(self) -> str:
         return "EV Grid Filter"
 
+    @property
+    def btc_mid_price(self) -> Optional[float]:
+        """Current Coinbase BTC spot mid price."""
+        with self._lock:
+            ev = self._ev
+        if ev is None:
+            return None
+        return ev._bfeed.mid_price
+
+    @property
+    def btc_cvd(self) -> Optional[float]:
+        """Current Coinbase cumulative volume delta."""
+        with self._lock:
+            ev = self._ev
+        if ev is None:
+            return None
+        return ev._bfeed.cvd
+
     # ── Core routing ──────────────────────────────────────────────────
 
     def process_tick(

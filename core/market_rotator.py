@@ -228,7 +228,7 @@ class MarketRotator(threading.Thread):
             self._on_remove(old_ticker)
 
         # Start new worker
-        market_id  = self._db.upsert_market(new_ticker, new_ticker)
+        market_id  = self._db.upsert_market(new_ticker, new_ticker, close_ts=float(new_close) if new_close else None)
         new_worker = MarketWorker(
             client=self._client,
             ticker=new_ticker,
