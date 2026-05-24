@@ -169,6 +169,9 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
             outcome = mkt.up or mkt.yes
             if outcome is None:
                 continue
+            # Hard filter: only KXBTC15M tickers (not KXBTCD, KXBTCH, etc.)
+            if not outcome.outcome_id.upper().startswith("KXBTC15M"):
+                continue
             markets.append(mkt)
 
         print(f"  page {page}: {len(batch)} fetched, {len(markets)} settled kept so far")
