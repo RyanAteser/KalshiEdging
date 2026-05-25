@@ -148,10 +148,11 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
     markets = []
     cursor  = None
     page    = 0
+    _debug_printed = False
 
     while True:
         params: dict = {
-            "slug":  "KXBTC15M",   # slug prefix match — tighter than free-text query
+            "series_ticker": "KXBTC15M",
             "limit": 200,
         }
         if cursor:
@@ -165,6 +166,16 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
         page += 1
         kept  = 0
 
+        # Debug: print first market's raw fields on page 1 so we can verify structure
+        if not _debug_printed and batch:
+            mkt0    = batch[0]
+            out0    = mkt0.up or mkt0.yes
+            out_id  = out0.outcome_id if out0 else "(no outcome)"
+            title   = getattr(mkt0, "title", "?")
+            ticker  = getattr(mkt0, "ticker", "?")
+            print(f"  [debug] first market: ticker={ticker!r}  outcome_id={out_id!r}  title={title!r}")
+            _debug_printed = True
+
         for mkt in batch:
             if mkt.resolution_date is None:
                 continue
@@ -175,8 +186,10 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
             outcome = mkt.up or mkt.yes
             if outcome is None:
                 continue
-            # Hard filter: reject anything that isn't exactly KXBTC15M-*
-            if not _is_kxbtc15m(outcome.outcome_id):
+            ticker = getattr(mkt, "ticker", "") or ""
+            out_id = outcome.outcome_id or ""
+            # Accept if either the market ticker or outcome_id starts with KXBTC15M
+            if not (_is_kxbtc15m(out_id) or _is_kxbtc15m(ticker)):
                 continue
             markets.append(mkt)
             kept += 1
