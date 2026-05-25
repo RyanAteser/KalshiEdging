@@ -133,8 +133,13 @@ def _with_retry(fn, label: str = "", max_attempts: int = 6):
     raise RuntimeError(f"Gave up after {max_attempts} retries ({label})")
 
 
+def _is_kxbtc15m(outcome_id: str) -> bool:
+    """Strict check: ticker must match KXBTC15M-DDMMMYY-T{strike} pattern."""
+    return bool(re.match(r'^KXBTC15M-', outcome_id, re.IGNORECASE))
+
+
 def _fetch_all_markets(kalshi, days: int | None) -> list:
-    """Page through all closed KXBTC15M markets."""
+    """Page through settled KXBTC15M markets only."""
     cutoff = None
     now    = datetime.now(timezone.utc)
     if days:
@@ -146,8 +151,8 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
 
     while True:
         params: dict = {
-            "query": "KXBTC15M",
-            "limit": 200,   # smaller pages — Kalshi rate-limits large scans
+            "slug":  "KXBTC15M",   # slug prefix match — tighter than free-text query
+            "limit": 200,
         }
         if cursor:
             params["cursor"] = cursor
@@ -158,28 +163,30 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
         )
         batch = result.data
         page += 1
+        kept  = 0
 
         for mkt in batch:
             if mkt.resolution_date is None:
                 continue
             if mkt.resolution_date > now:
-                continue   # not yet settled
+                continue
             if cutoff and mkt.resolution_date < cutoff:
                 continue
             outcome = mkt.up or mkt.yes
             if outcome is None:
                 continue
-            # Hard filter: only KXBTC15M tickers (not KXBTCD, KXBTCH, etc.)
-            if not outcome.outcome_id.upper().startswith("KXBTC15M"):
+            # Hard filter: reject anything that isn't exactly KXBTC15M-*
+            if not _is_kxbtc15m(outcome.outcome_id):
                 continue
             markets.append(mkt)
+            kept += 1
 
-        print(f"  page {page}: {len(batch)} fetched, {len(markets)} settled kept so far")
+        print(f"  page {page}: {len(batch)} fetched, {kept} KXBTC15M kept ({len(markets)} total)")
 
         if not result.next_cursor or len(batch) == 0:
             break
         cursor = result.next_cursor
-        time.sleep(1.5)   # respect Kalshi's rate limit between pages
+        time.sleep(1.5)
 
     return markets
 
