@@ -83,6 +83,12 @@ VOLUME_EARLY_SECS = [30, 60, 90, 120, 150, 180]
 VOLUME_PRICES     = [0.65, 0.70, 0.75, 0.80, 0.85]
 IMBALANCE_THRESHOLDS = [-0.5, -0.25, 0.0, 0.10, 0.25, 0.50]  # ob_imbalance cutoffs
 
+# Per-asset annual volatility defaults (rough historical figures)
+ASSET_VOL_DEFAULTS = {
+    "btc": 0.65, "eth": 0.80, "sol": 1.20,
+    "xrp": 1.00, "doge": 1.30, "bnb": 0.80,
+}
+
 
 # ── Implied distance ──────────────────────────────────────────────────────────
 
@@ -125,6 +131,98 @@ def _parse_strike(slug: str) -> float | None:
             if 10_000 <= v <= 200_000:
                 return v
     return None
+
+
+# ── Spot klines (Binance 1s OHLCV) ───────────────────────────────────────────
+
+def _load_spot_klines(zip_path: str, asset: str) -> pd.DataFrame | None:
+    """
+    Load Binance 1-second klines for `asset` from a multi-asset zip.
+    Expected path pattern: binance_{asset}_klines_1s/dt=YYYY-MM-DD/*.parquet
+    Returns a DataFrame with columns ['time', 'price'] sorted by time, or None.
+    """
+    prefix = f"binance_{asset}_klines_1s/"
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = sorted(n for n in zf.namelist()
+                       if n.startswith(prefix) and n.endswith(".parquet"))
+        if not names:
+            print(f"    No klines found for {asset.upper()} (prefix={prefix})")
+            return None
+        frames = []
+        for name in names:
+            if zf.getinfo(name).file_size == 0:
+                continue
+            try:
+                with zf.open(name) as fh:
+                    df = pd.read_parquet(io.BytesIO(fh.read()))
+                frames.append(df)
+            except Exception:
+                continue
+        if not frames:
+            return None
+        klines = pd.concat(frames, ignore_index=True)
+
+    # Detect time column (Binance uses open_time in ms; may also be 'time', 'ts')
+    time_col = next((c for c in ["open_time", "time", "ts", "timestamp"]
+                     if c in klines.columns), None)
+    # Detect price column (prefer 'close'; fall back to 'open' or 'price')
+    price_col = next((c for c in ["close", "open", "price"]
+                      if c in klines.columns), None)
+
+    if time_col is None or price_col is None:
+        print(f"    Klines columns: {klines.columns.tolist()} — cannot identify time/price")
+        return None
+
+    out = klines[[time_col, price_col]].copy()
+    out.columns = ["time", "price"]
+    out["time"]  = pd.to_datetime(out["time"], utc=True, unit="ms"
+                                  if out["time"].iloc[0] > 1e12 else None)
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna().sort_values("time").reset_index(drop=True)
+    print(f"    Loaded {len(out):,} klines for {asset.upper()} "
+          f"({out['time'].iloc[0].date()} – {out['time'].iloc[-1].date()})  "
+          f"median=${out['price'].median():,.0f}")
+    return out
+
+
+def _spot_at(klines: pd.DataFrame, ts: pd.Timestamp) -> float | None:
+    """Return the closest kline close price to `ts` (within ±60s)."""
+    if klines is None or klines.empty:
+        return None
+    idx = klines["time"].searchsorted(ts, side="left")
+    # Check the candidate and its neighbour
+    best_idx, best_dt = None, pd.Timedelta("61s")
+    for i in [max(0, idx - 1), min(idx, len(klines) - 1)]:
+        dt = abs(klines["time"].iloc[i] - ts)
+        if dt < best_dt:
+            best_dt, best_idx = dt, i
+    if best_idx is None:
+        return None
+    return float(klines["price"].iloc[best_idx])
+
+
+def _asset_distance_thresholds(asset_vol: float, median_spot: float) -> list[float]:
+    """
+    Compute dollar distance thresholds as multiples of the 1-sigma move at t=120s.
+    Uses [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4] × sigma.
+    Rounds to sensible precision and deduplicates.
+    """
+    rem_yrs   = (MARKET_DURATION - 120) / SECS_PER_YEAR
+    sigma_usd = asset_vol * np.sqrt(rem_yrs) * median_spot  # 1σ move in $
+    multiples = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
+    thresholds = []
+    for m in multiples:
+        raw = sigma_usd * m
+        # Round to 2 sig figs
+        if raw < 1:
+            t = round(raw, 2)
+        elif raw < 10:
+            t = round(raw, 1)
+        else:
+            t = round(raw, 0)
+        if t > 0 and t not in thresholds:
+            thresholds.append(t)
+    return thresholds
 
 
 # ── Per-market extraction ─────────────────────────────────────────────────────
@@ -200,8 +298,13 @@ def _load_zip(zip_path: str, sample_seconds: list[int]) -> list[dict]:
     return rows
 
 
-def _load_multiasset_zip(zip_path: str, asset: str, sample_seconds: list[int]) -> list[dict]:
-    """Load prices_{asset}_15m from a multi-asset zip (e.g. april_lastweek_15m.zip)."""
+def _load_multiasset_zip(zip_path: str, asset: str, sample_seconds: list[int],
+                          spot_klines: pd.DataFrame | None = None) -> list[dict]:
+    """
+    Load prices_{asset}_15m from a multi-asset zip.
+    If spot_klines is provided, uses the open-time spot price as the strike
+    (needed for directional contracts like eth-updown-15m that have no strike in the slug).
+    """
     prefix = f"prices_{asset}_15m/"
     rows: list[dict] = []
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -218,6 +321,12 @@ def _load_multiasset_zip(zip_path: str, asset: str, sample_seconds: list[int]) -
                 continue
             row = _process_market(df, sample_seconds)
             if row is not None:
+                # Override strike with actual spot price when slug has none
+                if spot_klines is not None and row.get("strike") is None:
+                    open_ts = pd.to_datetime(df["time"].iloc[0], utc=True)
+                    spot    = _spot_at(spot_klines, open_ts)
+                    if spot is not None:
+                        row["strike"] = spot
                 rows.append(row)
             del df
     gc.collect()
@@ -235,12 +344,13 @@ def _ev(win_rate: float, avg_price: float) -> float:
 
 # ── Reference table: price → implied distance ─────────────────────────────────
 
-def _print_price_dist_ref(btc_vol: float, strike: float = 95_000) -> None:
-    """Show how contract price maps to implied BTC distance at each entry time."""
+def _print_price_dist_ref(asset_vol: float, strike: float = 95_000,
+                           asset: str = "BTC") -> None:
+    """Show how contract price maps to implied asset distance at each entry time."""
     print(f"\n{'═'*90}")
-    print(f"  Price → Implied BTC Distance from Strike  "
-          f"(BTC=${strike:,.0f}  vol={btc_vol:.0%} annual)")
-    print(f"  Tells you: 'at this price, BTC is approximately $X from the strike'")
+    print(f"  Price → Implied {asset.upper()} Distance from Strike  "
+          f"({asset.upper()}=${strike:,.0f}  vol={asset_vol:.0%} annual)")
+    print(f"  Tells you: 'at this price, {asset.upper()} is approximately $X from the strike'")
     print(f"{'─'*90}")
 
     col_w = 9
@@ -254,8 +364,8 @@ def _print_price_dist_ref(btc_vol: float, strike: float = 95_000) -> None:
         mins_left = (MARKET_DURATION - sec) / 60
         print(f"  t={sec:>4}s", end="")
         for px in SWEEP_PRICES:
-            d = implied_dist(px, sec, strike, btc_vol)
-            print(f"  {f'${d:,.0f}':>{col_w}}", end="")
+            d = implied_dist(px, sec, strike, asset_vol)
+            print(f"  {f'${d:,.2f}':>{col_w}}", end="")
         print(f"  ({mins_left:.1f}m left)")
     print(f"{'═'*90}")
 
@@ -328,13 +438,14 @@ def _print_price_sweep(df: pd.DataFrame) -> None:
 
 # ── Distance-based sweep ──────────────────────────────────────────────────────
 
-def _print_distance_sweep(df: pd.DataFrame, btc_vol: float) -> None:
+def _print_distance_sweep(df: pd.DataFrame, asset_vol: float,
+                           distances: list | None = None) -> None:
     """
     Sweep by minimum implied distance ($ from strike) instead of minimum price.
-    More directly comparable to Kalshi live strategy filters.
+    `distances` defaults to SWEEP_DISTANCES; pass asset-scaled thresholds for non-BTC.
     """
     seconds   = [s for s in SWEEP_SECONDS if f"px_{s}" in df.columns]
-    distances = SWEEP_DISTANCES
+    distances = distances if distances is not None else SWEEP_DISTANCES
     col_w     = 16
 
     has_strike = df["strike"].notna()
@@ -349,7 +460,7 @@ def _print_distance_sweep(df: pd.DataFrame, btc_vol: float) -> None:
         if dist_col not in df.columns:
             px      = df[px_col].where(has_strike).clip(0.001, 0.999)
             strike  = df["strike"].fillna(95_000)
-            df[dist_col] = implied_dist(px.values, sec, strike.values, btc_vol)
+            df[dist_col] = implied_dist(px.values, sec, strike.values, asset_vol)
 
     # Build grids
     wr_rows, ev_rows, n_rows = [], [], []
@@ -378,7 +489,7 @@ def _print_distance_sweep(df: pd.DataFrame, btc_vol: float) -> None:
         print()
         print("  " + "─" * (6 + col_w * len(distances)))
 
-    _hdr(f"Win Rate by Entry Time × Min Implied Distance  (BTC vol={btc_vol:.0%})")
+    _hdr(f"Win Rate by Entry Time × Min Implied Distance  (vol={asset_vol:.0%})")
     for i, sec in enumerate(seconds):
         mins_left = (MARKET_DURATION - sec) / 60
         print(f"  t={sec:>4}", end="")
@@ -434,12 +545,14 @@ def _print_distance_sweep(df: pd.DataFrame, btc_vol: float) -> None:
 # ── 2D grid: price × distance at one entry time ───────────────────────────────
 
 def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
-                              btc_vol: float) -> None:
+                              asset_vol: float,
+                              distances: list | None = None) -> None:
     """
     For a single entry time, show win rate across all (min_price, min_distance) combos.
     """
     px_col   = f"px_{entry_second}"
     dist_col = f"idist_{entry_second}"
+    dist_list = distances if distances is not None else SWEEP_DISTANCES
 
     if px_col not in df.columns:
         return
@@ -447,8 +560,8 @@ def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
     if dist_col not in df.columns:
         has_strike = df["strike"].notna()
         px     = df[px_col].where(has_strike).clip(0.001, 0.999)
-        strike = df["strike"].fillna(95_000)
-        df[dist_col] = implied_dist(px.values, entry_second, strike.values, btc_vol)
+        strike = df["strike"].fillna(df["strike"].median() if has_strike.any() else 95_000)
+        df[dist_col] = implied_dist(px.values, entry_second, strike.values, asset_vol)
 
     mins_left = (MARKET_DURATION - entry_second) / 60
     print(f"\n{'═'*85}")
@@ -465,10 +578,10 @@ def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
     print("  " + "─" * (12 + col_w * len(SWEEP_PRICES)))
 
     ref_wr = None
-    ref_cell = (150, 0.90)
+    ref_cell = (dist_list[len(dist_list) // 3], 0.90)  # ~1/3 into the list
 
-    for min_d in [0] + SWEEP_DISTANCES:
-        label = f"≥${min_d}" if min_d > 0 else "any dist"
+    for min_d in [0] + dist_list:
+        label = f"≥${min_d:g}" if min_d > 0 else "any dist"
         print(f"  {label:>12}", end="")
         for min_px in SWEEP_PRICES:
             mask = (
@@ -492,7 +605,8 @@ def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
 
     print(f"{'═'*85}")
     if ref_wr:
-        print(f"  Reference (dist≥$150, price≥0.90): win={ref_wr:.1%}  "
+        rc_d, rc_px = ref_cell
+        print(f"  Reference (dist≥${rc_d:g}, price≥{rc_px}): win={ref_wr:.1%}  "
               f"← cells with ★ have positive EV regardless of win rate")
 
 
@@ -719,7 +833,13 @@ def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
              btc_vol: float, output_path: str | None,
              orderbook_zips: list[str] | None = None,
              data_zip: str | None = None,
-             asset: str = "eth") -> None:
+             asset: str = "eth",
+             asset_vol: float | None = None) -> None:
+
+    # Resolve volatility: explicit --asset-vol overrides --btc-vol, else use per-asset default
+    vol = asset_vol if asset_vol is not None else (
+          btc_vol if not data_zip else
+          ASSET_VOL_DEFAULTS.get(asset, btc_vol))
 
     # ── Volume analysis: requires paired prices + orderbook ──────────────────
     if orderbook_zips and prices_zips:
@@ -743,12 +863,14 @@ def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
         print("\nNote: --orderbook requires --prices to be provided too "
               "(settlement outcome comes from the prices files).")
 
-
     all_rows: list[dict] = []
     if data_zip:
         print(f"\nLoading {asset.upper()} from {Path(data_zip).name} …")
         secs = SWEEP_SECONDS if sweep else sorted(set(VOLUME_EARLY_SECS) | {entry_second})
-        all_rows = _load_multiasset_zip(data_zip, asset, secs)
+        # Load spot klines to resolve strike prices for directional contracts
+        print(f"  Loading {asset.upper()} spot klines …")
+        spot_klines = _load_spot_klines(data_zip, asset)
+        all_rows = _load_multiasset_zip(data_zip, asset, secs, spot_klines)
     else:
         for zp in prices_zips:
             all_rows.extend(_load_zip(zp, SWEEP_SECONDS if sweep else [entry_second]))
@@ -759,26 +881,42 @@ def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
     print(f"\n{asset_label}: {len(df)} settled markets  "
           f"(Up={n_up}  Down={len(df)-n_up}  base_rate={n_up/len(df):.1%})")
 
+    strike_coverage = df["strike"].notna().mean() if "strike" in df.columns else 0
+    if data_zip:
+        print(f"  Spot strike coverage: {strike_coverage:.1%}  "
+              f"(median=${df['strike'].median():,.0f})")
+
     # Volume analysis when data has imbalance/depth columns
     if data_zip and any(f"imb_{s}" in df.columns or f"depth_{s}" in df.columns
                         for s in VOLUME_EARLY_SECS):
         _print_volume_analysis(df)
 
     if sweep:
-        print(f"\nVol assumption: {btc_vol:.0%} annual  (override with --btc-vol)")
+        print(f"\nVol assumption: {vol:.0%} annual  "
+              f"(asset={asset_label}; override with --asset-vol)")
+
+        # Compute asset-appropriate distance thresholds
+        has_strike = "strike" in df.columns and df["strike"].notna().any()
+        median_spot = float(df["strike"].dropna().median()) if has_strike else 95_000
+        if data_zip and has_strike:
+            sweep_dists = _asset_distance_thresholds(vol, median_spot)
+            print(f"  Distance thresholds scaled to {asset_label} "
+                  f"~${median_spot:,.0f}: {[f'${d:g}' for d in sweep_dists]}")
+        else:
+            sweep_dists = None  # use SWEEP_DISTANCES default
 
         # 1. Price → distance reference table
-        avg_strike = float(df["strike"].dropna().mean()) if df["strike"].notna().any() else 95_000
-        _print_price_dist_ref(btc_vol, strike=round(avg_strike, -3))
+        _print_price_dist_ref(vol, strike=round(median_spot, -2 if median_spot < 10_000 else -3),
+                              asset=asset_label)
 
         # 2. Price-based sweep
         _print_price_sweep(df)
 
         # 3. Distance-based sweep
-        _print_distance_sweep(df, btc_vol)
+        _print_distance_sweep(df, vol, distances=sweep_dists)
 
         # 4. 2D grid at the best entry time (t=300s)
-        _print_price_x_dist_grid(df, 300, btc_vol)
+        _print_price_x_dist_grid(df, 300, vol, distances=sweep_dists)
 
     else:
         px_col = f"px_{entry_second}"
@@ -836,8 +974,14 @@ Examples:
                         choices=["eth", "btc", "sol", "xrp", "doge", "bnb"],
                         help="Asset to analyse from --data-zip (default: eth)")
     parser.add_argument("--btc-vol", type=float, default=0.65,
-                        help="Annual volatility assumption (default 0.65 = 65%%)")
+                        help="Annual vol for BTC prices files (default 0.65 = 65%%)")
+    parser.add_argument("--asset-vol", type=float, default=None,
+                        help=("Annual vol for the chosen asset. "
+                              "Auto-defaults: btc=65%%, eth=80%%, sol=120%%, "
+                              "xrp=100%%, doge=130%%, bnb=80%%. "
+                              "Overrides --btc-vol when --data-zip is used."))
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
     backtest(args.prices, args.entry_second, args.sweep, args.btc_vol, args.output,
-             orderbook_zips=args.orderbook, data_zip=args.data_zip, asset=args.asset)
+             orderbook_zips=args.orderbook, data_zip=args.data_zip, asset=args.asset,
+             asset_vol=args.asset_vol)
