@@ -79,6 +79,9 @@ SECS_PER_YEAR    = 365.25 * 24 * 3600
 SWEEP_SECONDS    = [30, 60, 90, 120, 150, 180, 300, 420, 540, 600, 660, 720, 750, 810, 870]
 SWEEP_PRICES     = [0.75, 0.80, 0.85, 0.875, 0.90, 0.915, 0.93, 0.945, 0.96]
 SWEEP_DISTANCES  = [50, 100, 150, 200, 250, 300, 400, 500, 750, 1000]  # implied $ from strike
+VOLUME_EARLY_SECS = [30, 60, 90, 120, 150, 180]
+VOLUME_PRICES     = [0.65, 0.70, 0.75, 0.80, 0.85]
+IMBALANCE_THRESHOLDS = [-0.5, -0.25, 0.0, 0.10, 0.25, 0.50]  # ob_imbalance cutoffs
 
 
 # ── Implied distance ──────────────────────────────────────────────────────────
@@ -459,10 +462,229 @@ def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
               f"← cells with ★ have positive EV regardless of win rate")
 
 
+# ── Orderbook loading ─────────────────────────────────────────────────────────
+
+def _process_ob_market(df: pd.DataFrame, sample_seconds: list[int]) -> dict | None:
+    """Extract price + volume at each entry second from an orderbook parquet."""
+    if "best_ask" not in df.columns or len(df) < 5:
+        return None
+
+    df = df.sort_values("time").reset_index(drop=True)
+    slug     = df["slug"].iloc[0]
+    open_ts  = df["time"].iloc[0]
+    date_str = open_ts.strftime("%Y-%m-%d")
+
+    # Settlement: final best_bid of the Up contract
+    final_bids = df["best_bid"].dropna()
+    if len(final_bids) == 0:
+        return None
+    last = float(final_bids.iloc[-1])
+    if last >= SETTLED_THRESH:
+        outcome_val = 1
+    elif last <= (1.0 - SETTLED_THRESH):
+        outcome_val = 0
+    else:
+        return None
+
+    row: dict = {"slug": slug, "date": date_str, "outcome": outcome_val}
+
+    for sec in sample_seconds:
+        target  = open_ts + pd.Timedelta(seconds=sec)
+        cands   = df[df["time"] <= target + pd.Timedelta(seconds=3)]
+        if cands.empty:
+            continue
+        er  = cands.iloc[-1]
+        ask = float(er["best_ask"]) if pd.notna(er["best_ask"]) else 0.0
+        if ask <= 0 or ask >= 1:
+            continue
+        row[f"px_{sec}"]     = ask
+        row[f"ask_sz_{sec}"] = float(er["top_ask_size"])  if pd.notna(er["top_ask_size"])  else 0.0
+        row[f"bid_sz_{sec}"] = float(er["top_bid_size"])  if pd.notna(er["top_bid_size"])  else 0.0
+        row[f"imb_{sec}"]    = float(er["ob_imbalance"])  if pd.notna(er["ob_imbalance"])  else 0.0
+        row[f"depth_{sec}"]  = (float(er["sum_ask_size"]) + float(er["sum_bid_size"])
+                                if pd.notna(er["sum_ask_size"]) else 0.0)
+
+    return row
+
+
+def _load_ob_zip(zip_path: str, sample_seconds: list[int]) -> list[dict]:
+    """Load an orderbook zip — one parquet per market."""
+    rows: list[dict] = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
+        print(f"  {zip_path}: {len(names)} orderbook files")
+        for name in names:
+            if zf.getinfo(name).file_size == 0:
+                continue
+            try:
+                with zf.open(name) as fh:
+                    df = pd.read_parquet(io.BytesIO(fh.read()))
+            except Exception:
+                continue
+            row = _process_ob_market(df, sample_seconds)
+            if row is not None:
+                rows.append(row)
+            del df
+    gc.collect()
+    print(f"    → {len(rows)} settled Up-contracts extracted")
+    return rows
+
+
+# ── Volume analysis ───────────────────────────────────────────────────────────
+
+def _print_volume_analysis(df: pd.DataFrame) -> None:
+    """
+    Three tables for the volume-trigger hypothesis:
+      1. Volume distribution (top_ask_size percentiles at each early entry time)
+      2. Price × volume tier grid at t=120s  (LOW / MED / HIGH ask_size)
+      3. Price × OB-imbalance grid  (tests: buy cheap + positive bid pressure)
+    """
+
+    # ── 1. Volume distribution ────────────────────────────────────────────────
+    print(f"\n{'═'*80}")
+    print("  Ask-Size Distribution at Entry  (top_ask_size percentiles, contracts)")
+    print(f"{'─'*80}")
+    print(f"  {'t(s)':>6}  {'p10':>9}  {'p25':>9}  {'p50':>9}  {'p75':>9}  {'p90':>9}  {'mean':>9}  {'n':>6}")
+    print("  " + "─" * 73)
+    for sec in VOLUME_EARLY_SECS:
+        col = f"ask_sz_{sec}"
+        if col not in df.columns:
+            continue
+        s = df[col].dropna()
+        if len(s) < 5:
+            continue
+        print(f"  {sec:>5}s  {s.quantile(.10):>9.0f}  {s.quantile(.25):>9.0f}  "
+              f"{s.quantile(.50):>9.0f}  {s.quantile(.75):>9.0f}  "
+              f"{s.quantile(.90):>9.0f}  {s.mean():>9.0f}  {len(s):>6}")
+    print(f"{'═'*80}")
+
+    # ── 2. Price × volume tier at t=120s ─────────────────────────────────────
+    col_px  = "px_120"
+    col_vol = "ask_sz_120"
+    if col_px in df.columns and col_vol in df.columns:
+        focus = df[[col_px, col_vol, "outcome"]].dropna()
+        if len(focus) >= MIN_TRADES * 3:
+            p33 = focus[col_vol].quantile(0.33)
+            p67 = focus[col_vol].quantile(0.67)
+            tiers = [
+                (f"LOW  (<{p33:,.0f})",                focus[col_vol] < p33),
+                (f"MED  ({p33:,.0f}–{p67:,.0f})",     (focus[col_vol] >= p33) & (focus[col_vol] < p67)),
+                (f"HIGH (≥{p67:,.0f})",                focus[col_vol] >= p67),
+            ]
+            col_w = 24
+            print(f"\n{'═'*90}")
+            print("  Price × Ask-Volume Tier at t=120s  (format: win% / n / EV)")
+            print("  LOW=bot-33%  MED=mid-33%  HIGH=top-33% of top_ask_size")
+            print(f"{'─'*90}")
+            print(f"  {'price≥':>8}", end="")
+            for label, _ in tiers:
+                print(f"  {label:>{col_w}}", end="")
+            print()
+            print("  " + "─" * (8 + (col_w + 2) * 3))
+            for px in VOLUME_PRICES:
+                mask_px = focus[col_px] >= px
+                print(f"  {px:>8.3f}", end="")
+                for label, mask_vol in tiers:
+                    grp = focus[mask_px & mask_vol]
+                    n   = len(grp)
+                    if n < MIN_TRADES:
+                        print(f"  {'—':>{col_w}}", end="")
+                    else:
+                        wr   = float(grp["outcome"].mean())
+                        ep   = float(grp[col_px].mean())
+                        e    = _ev(wr, ep)
+                        cell = f"{wr:.1%} / {n} / {e:+.3f}"
+                        print(f"  {cell:>{col_w}}", end="")
+                print()
+            print(f"{'═'*90}")
+
+    # ── 3. Price × OB-imbalance grid at t=120s ───────────────────────────────
+    col_imb = "imb_120"
+    if col_px in df.columns and col_imb in df.columns:
+        focus = df[[col_px, col_imb, "outcome"]].dropna()
+        if len(focus) >= MIN_TRADES:
+            col_w = 20
+            print(f"\n{'═'*88}")
+            print("  Price × OB Imbalance at t=120s  (imbalance>0 = more bids = bullish pressure)")
+            print("  format: win% / n / EV")
+            print(f"{'─'*88}")
+            print(f"  {'imbalance≥':>12}", end="")
+            for px in VOLUME_PRICES:
+                print(f"  {f'px≥{px:.2f}':>{col_w}}", end="")
+            print()
+            print("  " + "─" * (12 + (col_w + 2) * len(VOLUME_PRICES)))
+            for imb in IMBALANCE_THRESHOLDS:
+                mask_imb = focus[col_imb] >= imb
+                print(f"  {imb:>12.2f}", end="")
+                for px in VOLUME_PRICES:
+                    grp = focus[mask_imb & (focus[col_px] >= px)]
+                    n   = len(grp)
+                    if n < MIN_TRADES:
+                        print(f"  {'—':>{col_w}}", end="")
+                    else:
+                        wr   = float(grp["outcome"].mean())
+                        ep   = float(grp[col_px].mean())
+                        e    = _ev(wr, ep)
+                        cell = f"{wr:.1%} / {n} / {e:+.3f}"
+                        print(f"  {cell:>{col_w}}", end="")
+                print()
+            print(f"{'═'*88}")
+            print("  Insight: positive imbalance at low price = buyers confident despite cheap contract")
+
+    # ── 4. Combined rule: buy at 0.70 only when imbalance is strongly positive ─
+    col_imb = "imb_120"
+    if col_px in df.columns and col_imb in df.columns:
+        focus = df[[col_px, col_imb, col_vol, "outcome", "date"]].dropna()
+        n_days = focus["date"].nunique() if "date" in focus.columns else 1
+        print(f"\n{'═'*80}")
+        print("  Combined Rule Sweep at t=120s")
+        print("  Rule A: price ≥ 0.80  (baseline — no volume filter)")
+        print("  Rule B: price ≥ 0.70  AND  imbalance ≥ threshold  (cheap + bullish book)")
+        print(f"{'─'*80}")
+        print(f"  {'Rule':>30}  {'win%':>7}  {'EV':>8}  {'n/day':>7}  {'total n':>8}")
+        print("  " + "─" * 66)
+        # Baseline
+        base = focus[focus[col_px] >= 0.80]
+        if len(base) >= MIN_TRADES:
+            wr = float(base["outcome"].mean())
+            ep = float(base[col_px].mean())
+            print(f"  {'A: px≥0.80 (no volume filter)':>30}  "
+                  f"{wr:>7.1%}  {_ev(wr,ep):>+8.3f}  {len(base)/n_days:>7.1f}  {len(base):>8}")
+        for imb in [0.0, 0.10, 0.25, 0.50]:
+            grp = focus[(focus[col_px] >= 0.70) & (focus[col_imb] >= imb)]
+            if len(grp) < MIN_TRADES:
+                continue
+            wr = float(grp["outcome"].mean())
+            ep = float(grp[col_px].mean())
+            label = f"B: px≥0.70 + imb≥{imb:.2f}"
+            print(f"  {label:>30}  "
+                  f"{wr:>7.1%}  {_ev(wr,ep):>+8.3f}  {len(grp)/n_days:>7.1f}  {len(grp):>8}")
+        print(f"{'═'*80}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
-             btc_vol: float, output_path: str | None) -> None:
+             btc_vol: float, output_path: str | None,
+             orderbook_zips: list[str] | None = None) -> None:
+
+    # ── Orderbook volume analysis (independent of prices) ────────────────────
+    if orderbook_zips:
+        print("\nLoading orderbook data for volume analysis …")
+        ob_rows: list[dict] = []
+        for zp in orderbook_zips:
+            ob_rows.extend(_load_ob_zip(zp, VOLUME_EARLY_SECS))
+        if ob_rows:
+            ob_df = pd.DataFrame(ob_rows)
+            n_up_ob = int((ob_df["outcome"] == 1).sum())
+            print(f"\nOrderbook dataset: {len(ob_df)} settled markets  "
+                  f"(Up={n_up_ob}  Down={len(ob_df)-n_up_ob}  base_rate={n_up_ob/len(ob_df):.1%})")
+            _print_volume_analysis(ob_df)
+        else:
+            print("  No valid orderbook markets found.")
+
+    if not prices_zips:
+        return
 
     all_rows: list[dict] = []
     for zp in prices_zips:
@@ -532,13 +754,17 @@ Examples:
   python ml/backtest.py --prices "E:\\...zip" --sweep --btc-vol 0.70
   python ml/backtest.py --prices "E:\\...zip" --entry-second 300 --output bt.csv
 """)
-    parser.add_argument("--prices", required=True, nargs="+")
+    parser.add_argument("--prices", nargs="+", default=[],
+                        help="Prices zip files (omit to run volume-only analysis)")
     parser.add_argument("--sweep", action="store_true",
                         help="Full sweep: entry time × price × distance")
     parser.add_argument("--entry-second", type=int, default=300,
                         help="Entry time for single-point analysis (default 300)")
+    parser.add_argument("--orderbook", nargs="+", default=None,
+                        help="Orderbook zip files — enables volume + imbalance analysis")
     parser.add_argument("--btc-vol", type=float, default=0.65,
                         help="BTC annual volatility assumption (default 0.65 = 65%%)")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
-    backtest(args.prices, args.entry_second, args.sweep, args.btc_vol, args.output)
+    backtest(args.prices, args.entry_second, args.sweep, args.btc_vol, args.output,
+             orderbook_zips=args.orderbook)
