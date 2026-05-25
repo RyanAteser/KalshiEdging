@@ -175,8 +175,13 @@ def _load_spot_klines(zip_path: str, asset: str) -> pd.DataFrame | None:
 
     out = klines[[time_col, price_col]].copy()
     out.columns = ["time", "price"]
-    out["time"]  = pd.to_datetime(out["time"], utc=True, unit="ms"
-                                  if out["time"].iloc[0] > 1e12 else None)
+    # Convert time: detect ms integers vs already-parsed Timestamps
+    raw = out["time"].iloc[0]
+    if pd.api.types.is_integer_dtype(out["time"]) or (
+            isinstance(raw, (int, float)) and raw > 1e12):
+        out["time"] = pd.to_datetime(out["time"], utc=True, unit="ms")
+    else:
+        out["time"] = pd.to_datetime(out["time"], utc=True)
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     out = out.dropna().sort_values("time").reset_index(drop=True)
     print(f"    Loaded {len(out):,} klines for {asset.upper()} "
