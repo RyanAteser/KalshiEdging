@@ -133,8 +133,13 @@ def _with_retry(fn, label: str = "", max_attempts: int = 6):
     raise RuntimeError(f"Gave up after {max_attempts} retries ({label})")
 
 
+def _is_kxbtc15m(outcome_id: str) -> bool:
+    """Strict check: ticker must match KXBTC15M-DDMMMYY-T{strike} pattern."""
+    return bool(re.match(r'^KXBTC15M-', outcome_id, re.IGNORECASE))
+
+
 def _fetch_all_markets(kalshi, days: int | None) -> list:
-    """Page through all closed KXBTC15M markets."""
+    """Page through settled KXBTC15M markets only."""
     cutoff = None
     now    = datetime.now(timezone.utc)
     if days:
@@ -146,8 +151,8 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
 
     while True:
         params: dict = {
-            "query": "KXBTC15M",
-            "limit": 200,   # smaller pages — Kalshi rate-limits large scans
+            "slug":  "KXBTC15M",   # slug prefix match — tighter than free-text query
+            "limit": 200,
         }
         if cursor:
             params["cursor"] = cursor
@@ -158,25 +163,30 @@ def _fetch_all_markets(kalshi, days: int | None) -> list:
         )
         batch = result.data
         page += 1
+        kept  = 0
 
         for mkt in batch:
             if mkt.resolution_date is None:
                 continue
             if mkt.resolution_date > now:
-                continue   # not yet settled
+                continue
             if cutoff and mkt.resolution_date < cutoff:
                 continue
             outcome = mkt.up or mkt.yes
             if outcome is None:
                 continue
+            # Hard filter: reject anything that isn't exactly KXBTC15M-*
+            if not _is_kxbtc15m(outcome.outcome_id):
+                continue
             markets.append(mkt)
+            kept += 1
 
-        print(f"  page {page}: {len(batch)} fetched, {len(markets)} settled kept so far")
+        print(f"  page {page}: {len(batch)} fetched, {kept} KXBTC15M kept ({len(markets)} total)")
 
         if not result.next_cursor or len(batch) == 0:
             break
         cursor = result.next_cursor
-        time.sleep(1.5)   # respect Kalshi's rate limit between pages
+        time.sleep(1.5)
 
     return markets
 
@@ -265,6 +275,10 @@ def _sample_market(kalshi, mkt, entry_seconds: list[int], btc_vol: float, rate_d
             continue
         mid = (bid + ask) / 2 if bid else ask
 
+        ask_size   = ob.asks[0].size if ob.asks else 0.0
+        bid_size   = ob.bids[0].size if ob.bids else 0.0
+        book_depth = sum(l.size for l in ob.asks) + sum(l.size for l in ob.bids)
+
         rows.append({
             "slug":         slug,
             "date":         date_str,
@@ -272,6 +286,9 @@ def _sample_market(kalshi, mkt, entry_seconds: list[int], btc_vol: float, rate_d
             "entry_second": t_sec,
             "entry_price":  ask,
             "mid":          mid,
+            "ask_size":     ask_size,
+            "bid_size":     bid_size,
+            "book_depth":   book_depth,
             "outcome":      outcome_val,
         })
 
@@ -459,6 +476,158 @@ def _print_2d_grid(df: pd.DataFrame, entry_second: int, btc_vol: float) -> None:
     print(f"{'═'*100}")
 
 
+# ── Volume analysis (early entry: first 3 minutes) ───────────────────────────
+
+EARLY_SECONDS  = [30, 60, 90, 120, 150, 180]
+VOL_THRESHOLDS = [10, 25, 50, 100, 200, 500]   # ask_size contract thresholds
+
+
+def _print_volume_analysis(df: pd.DataFrame) -> None:
+    """
+    Tests the volume-gated entry hypothesis:
+      Rule A: price ≥ 0.80  AND  ask_size ≥ threshold  (high volume = confident)
+      Rule B: price ≥ 0.85  AND  ask_size <  threshold  (low  volume = need more edge)
+      Combined: A OR B
+
+    Prints:
+      1. Volume distribution at each early entry time
+      2. Price × volume tier win rate grid at t=120s
+      3. Combined-rule sweep across volume thresholds
+    """
+    if "ask_size" not in df.columns:
+        print("\n  (No volume data — re-fetch with updated script)")
+        return
+
+    early = df[df["entry_second"].isin(EARLY_SECONDS)].copy()
+    if len(early) < MIN_TRADES:
+        print("\n  (Not enough early-entry rows for volume analysis)")
+        return
+
+    n_days = early["date"].nunique() if "date" in early.columns else 1
+
+    # ── 1. Volume distribution ────────────────────────────────────────────────
+    print(f"\n{'═'*72}")
+    print("  Ask-Size Distribution at Entry  (contracts available at best ask)")
+    print(f"{'─'*72}")
+    print(f"  {'t(s)':>7}  {'p10':>6}  {'p25':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'mean':>7}  {'n':>6}")
+    print("  " + "─" * 64)
+    for t in EARLY_SECONDS:
+        sub = early[(early["entry_second"] == t) & early["ask_size"].notna()]
+        if len(sub) < 5:
+            continue
+        s = sub["ask_size"]
+        print(f"  {t:>6}s  {s.quantile(.10):>6.0f}  {s.quantile(.25):>6.0f}  "
+              f"{s.quantile(.50):>6.0f}  {s.quantile(.75):>6.0f}  "
+              f"{s.quantile(.90):>6.0f}  {s.mean():>7.1f}  {len(sub):>6}")
+    print(f"{'═'*72}")
+
+    # ── 2. Price × volume tier grid at t=120s ────────────────────────────────
+    focus = early[early["entry_second"] == 120].copy()
+    if len(focus) >= MIN_TRADES:
+        p33 = focus["ask_size"].quantile(0.33)
+        p67 = focus["ask_size"].quantile(0.67)
+
+        def _tier(s):
+            if s < p33:   return f"LOW (<{p33:.0f})"
+            if s < p67:   return f"MED ({p33:.0f}–{p67:.0f})"
+            return         f"HIGH (>{p67:.0f})"
+
+        focus["vtier"] = focus["ask_size"].apply(_tier)
+        tiers = [f"LOW (<{p33:.0f})", f"MED ({p33:.0f}–{p67:.0f})", f"HIGH (>{p67:.0f})"]
+        prices = [0.75, 0.80, 0.85, 0.875, 0.90]
+
+        print(f"\n{'═'*80}")
+        print(f"  Price × Volume Tier at t=120s  "
+              f"(LOW=bot 33%  MED=mid  HIGH=top 33%  of ask_size)")
+        print(f"  format: win% / n / EV")
+        print(f"{'─'*80}")
+        col_w = 20
+        print(f"  {'price':>10}", end="")
+        for tier in tiers:
+            print(f"  {tier:>{col_w}}", end="")
+        print()
+        print("  " + "─" * (10 + (col_w + 2) * len(tiers)))
+        for px in prices:
+            print(f"  {px:>10.3f}", end="")
+            for tier in tiers:
+                grp = focus[(focus["entry_price"] >= px) & (focus["vtier"] == tier)]
+                n   = len(grp)
+                if n < MIN_TRADES:
+                    print(f"  {'—':>{col_w}}", end="")
+                    continue
+                wr = float(grp["outcome"].mean())
+                ep = float(grp["entry_price"].mean())
+                e  = _ev(wr, ep)
+                cell = f"{wr:.0%} / {n} / {e:+.3f}"
+                print(f"  {cell:>{col_w}}", end="")
+            print()
+        print(f"{'═'*80}")
+
+    # ── 3. Combined rule sweep ────────────────────────────────────────────────
+    print(f"\n{'═'*92}")
+    print("  Combined Rule Sweep (first 3 minutes: t=30–180s)")
+    print("  Rule A: price ≥ 0.80  AND  ask_size ≥ threshold  (high volume, lower price ok)")
+    print("  Rule B: price ≥ 0.85  AND  ask_size <  threshold  (low  volume, need more edge)")
+    print("  Combined = A OR B (mutually exclusive by threshold)")
+    print(f"{'─'*92}")
+    print(f"  {'threshold':>12}  "
+          f"{'Rule A win%':>12}  {'A EV':>8}  {'A n/day':>8}  "
+          f"{'Rule B win%':>12}  {'B EV':>8}  {'B n/day':>8}  "
+          f"{'Combined win%':>14}  {'Comb EV':>8}  {'Comb n/day':>10}")
+    print("  " + "─" * 90)
+
+    for thresh in VOL_THRESHOLDS:
+        a = early[(early["entry_price"] >= 0.80) & (early["ask_size"] >= thresh)]
+        b = early[(early["entry_price"] >= 0.85) & (early["ask_size"] <  thresh)]
+        combined = pd.concat([a, b]).drop_duplicates()
+
+        def _row(grp):
+            if len(grp) < MIN_TRADES:
+                return "—", float("nan"), 0.0
+            wr = float(grp["outcome"].mean())
+            ep = float(grp["entry_price"].mean())
+            return f"{wr:.1%}", _ev(wr, ep), len(grp) / n_days
+
+        a_wr, a_ev, a_nd = _row(a)
+        b_wr, b_ev, b_nd = _row(b)
+        c_wr, c_ev, c_nd = _row(combined)
+
+        def _ev_str(e): return f"{e:+.3f}" if not pd.isna(e) else "—"
+
+        print(f"  ask≥{thresh:>7}  "
+              f"  {a_wr:>12}  {_ev_str(a_ev):>8}  {a_nd:>8.1f}  "
+              f"  {b_wr:>12}  {_ev_str(b_ev):>8}  {b_nd:>8.1f}  "
+              f"  {c_wr:>14}  {_ev_str(c_ev):>8}  {c_nd:>10.1f}")
+
+    print(f"{'═'*92}")
+    print("  ★ Best combined rule = highest EV × n/day product")
+
+    # Find best combined row
+    best = None
+    best_score = -999
+    for thresh in VOL_THRESHOLDS:
+        a = early[(early["entry_price"] >= 0.80) & (early["ask_size"] >= thresh)]
+        b = early[(early["entry_price"] >= 0.85) & (early["ask_size"] <  thresh)]
+        combined = pd.concat([a, b]).drop_duplicates()
+        if len(combined) < MIN_TRADES:
+            continue
+        wr = float(combined["outcome"].mean())
+        ep = float(combined["entry_price"].mean())
+        e  = _ev(wr, ep)
+        nd = len(combined) / n_days
+        score = e * nd
+        if score > best_score:
+            best_score = score
+            best = (thresh, wr, e, nd)
+
+    if best:
+        thresh, wr, e, nd = best
+        print(f"\n  ★  Best: ask_size threshold = {thresh}")
+        print(f"       Rule A (≥0.80 + ask≥{thresh}): buy when volume confirms")
+        print(f"       Rule B (≥0.85 + ask<{thresh}):  buy when volume is thin but price is strong")
+        print(f"       Combined: win={wr:.1%}  EV={e:+.3f}  ~{nd:.1f} trades/day")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(
@@ -488,7 +657,8 @@ def run(
             print("No markets found. Try --days 180 or check your API key.")
             return
 
-        entry_times = SWEEP_SECONDS if sweep else sorted({entry_second, 300})
+        # Always include early seconds so volume analysis has data
+        entry_times = SWEEP_SECONDS if sweep else sorted(set(EARLY_SECONDS) | {entry_second, 300})
 
         all_rows: list[dict] = []
         for i, mkt in enumerate(markets):
@@ -523,6 +693,7 @@ def run(
         _print_distance_sweep(df, btc_vol)
 
     _print_2d_grid(df, entry_second, btc_vol)
+    _print_volume_analysis(df)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
