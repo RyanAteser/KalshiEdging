@@ -152,11 +152,14 @@ def _process_market(prices_df: pd.DataFrame, sample_seconds: list[int]) -> dict 
         ts       = pd.to_datetime(prices_df["time"].iloc[0], utc=True)
         date_str = ts.strftime("%Y-%m-%d")
 
+    has_imb   = "up_ob_imbalance" in prices_df.columns
+    has_depth = "up_total_depth"  in prices_df.columns
+
     row: dict = {
-        "slug":       slug,
-        "date":       date_str,
-        "strike":     _parse_strike(slug),
-        "outcome":    outcome,
+        "slug":    slug,
+        "date":    date_str,
+        "strike":  _parse_strike(slug),
+        "outcome": outcome,
     }
 
     for sec in sample_seconds:
@@ -165,6 +168,12 @@ def _process_market(prices_df: pd.DataFrame, sample_seconds: list[int]) -> dict 
         ask   = float(er.get("up_ask")        or 0.0)
         micro = float(er.get("up_microprice") or 0.0)
         row[f"px_{sec}"] = ask if ask > 0 else micro
+        if has_imb:
+            v = er["up_ob_imbalance"]
+            row[f"imb_{sec}"] = float(v) if pd.notna(v) else 0.0
+        if has_depth:
+            v = er["up_total_depth"]
+            row[f"depth_{sec}"] = float(v) if pd.notna(v) else 0.0
 
     return row
 
@@ -177,6 +186,31 @@ def _load_zip(zip_path: str, sample_seconds: list[int]) -> list[dict]:
         names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
         print(f"  {zip_path}: {len(names)} markets")
         for name in names:
+            try:
+                with zf.open(name) as fh:
+                    df = pd.read_parquet(io.BytesIO(fh.read()))
+            except Exception:
+                continue
+            row = _process_market(df, sample_seconds)
+            if row is not None:
+                rows.append(row)
+            del df
+    gc.collect()
+    print(f"    → {len(rows)} settled markets extracted")
+    return rows
+
+
+def _load_multiasset_zip(zip_path: str, asset: str, sample_seconds: list[int]) -> list[dict]:
+    """Load prices_{asset}_15m from a multi-asset zip (e.g. april_lastweek_15m.zip)."""
+    prefix = f"prices_{asset}_15m/"
+    rows: list[dict] = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = sorted(n for n in zf.namelist()
+                       if n.startswith(prefix) and n.endswith(".parquet"))
+        print(f"  {asset.upper()} prices: {len(names)} files in zip")
+        for name in names:
+            if zf.getinfo(name).file_size == 0:
+                continue
             try:
                 with zf.open(name) as fh:
                     df = pd.read_parquet(io.BytesIO(fh.read()))
@@ -552,15 +586,19 @@ def _print_volume_analysis(df: pd.DataFrame) -> None:
       3. Price × OB-imbalance grid  (tests: buy cheap + positive bid pressure)
     """
 
-    # ── 1. Volume distribution ────────────────────────────────────────────────
+    # ── 1. Volume / depth distribution ───────────────────────────────────────
+    # prefer top_ask_size (paired orderbook); fall back to total book depth
+    vol_col_fn = lambda s: f"ask_sz_{s}" if f"ask_sz_{s}" in df.columns else (
+                            f"depth_{s}"  if f"depth_{s}"  in df.columns else None)
+    vol_label  = "top_ask_size" if "ask_sz_30" in df.columns else "total_book_depth"
     print(f"\n{'═'*80}")
-    print("  Ask-Size Distribution at Entry  (top_ask_size percentiles, contracts)")
+    print(f"  Volume Distribution at Entry  ({vol_label} percentiles)")
     print(f"{'─'*80}")
     print(f"  {'t(s)':>6}  {'p10':>9}  {'p25':>9}  {'p50':>9}  {'p75':>9}  {'p90':>9}  {'mean':>9}  {'n':>6}")
     print("  " + "─" * 73)
     for sec in VOLUME_EARLY_SECS:
-        col = f"ask_sz_{sec}"
-        if col not in df.columns:
+        col = vol_col_fn(sec)
+        if col is None or col not in df.columns:
             continue
         s = df[col].dropna()
         if len(s) < 5:
@@ -572,7 +610,8 @@ def _print_volume_analysis(df: pd.DataFrame) -> None:
 
     # ── 2. Price × volume tier at t=120s ─────────────────────────────────────
     col_px  = "px_120"
-    col_vol = "ask_sz_120"
+    col_vol = "ask_sz_120" if "ask_sz_120" in df.columns else (
+              "depth_120"  if "depth_120"  in df.columns else "ask_sz_120")
     if col_px in df.columns and col_vol in df.columns:
         focus = df[[col_px, col_vol, "outcome"]].dropna()
         if len(focus) >= MIN_TRADES * 3:
@@ -678,7 +717,9 @@ def _print_volume_analysis(df: pd.DataFrame) -> None:
 
 def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
              btc_vol: float, output_path: str | None,
-             orderbook_zips: list[str] | None = None) -> None:
+             orderbook_zips: list[str] | None = None,
+             data_zip: str | None = None,
+             asset: str = "eth") -> None:
 
     # ── Volume analysis: requires paired prices + orderbook ──────────────────
     if orderbook_zips and prices_zips:
@@ -704,17 +745,27 @@ def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
 
 
     all_rows: list[dict] = []
-    for zp in prices_zips:
-        all_rows.extend(_load_zip(zp, SWEEP_SECONDS if sweep else [entry_second]))
+    if data_zip:
+        print(f"\nLoading {asset.upper()} from {Path(data_zip).name} …")
+        secs = SWEEP_SECONDS if sweep else sorted(set(VOLUME_EARLY_SECS) | {entry_second})
+        all_rows = _load_multiasset_zip(data_zip, asset, secs)
+    else:
+        for zp in prices_zips:
+            all_rows.extend(_load_zip(zp, SWEEP_SECONDS if sweep else [entry_second]))
 
     df = pd.DataFrame(all_rows)
     n_up = int((df["outcome"] == 1).sum())
-    print(f"\nTotal: {len(df)} settled markets  "
+    asset_label = asset.upper() if data_zip else "BTC"
+    print(f"\n{asset_label}: {len(df)} settled markets  "
           f"(Up={n_up}  Down={len(df)-n_up}  base_rate={n_up/len(df):.1%})")
 
+    # Volume analysis when data has imbalance/depth columns
+    if data_zip and any(f"imb_{s}" in df.columns or f"depth_{s}" in df.columns
+                        for s in VOLUME_EARLY_SECS):
+        _print_volume_analysis(df)
+
     if sweep:
-        print(f"\nBTC vol assumption: {btc_vol:.0%} annual  "
-              f"(override with --btc-vol)")
+        print(f"\nVol assumption: {btc_vol:.0%} annual  (override with --btc-vol)")
 
         # 1. Price → distance reference table
         avg_strike = float(df["strike"].dropna().mean()) if df["strike"].notna().any() else 95_000
@@ -779,9 +830,14 @@ Examples:
                         help="Entry time for single-point analysis (default 300)")
     parser.add_argument("--orderbook", nargs="+", default=None,
                         help="Orderbook zip files — enables volume + imbalance analysis")
+    parser.add_argument("--data-zip", default=None,
+                        help="Multi-asset zip (april_lastweek_15m.zip) — use with --asset")
+    parser.add_argument("--asset", default="eth",
+                        choices=["eth", "btc", "sol", "xrp", "doge", "bnb"],
+                        help="Asset to analyse from --data-zip (default: eth)")
     parser.add_argument("--btc-vol", type=float, default=0.65,
-                        help="BTC annual volatility assumption (default 0.65 = 65%%)")
+                        help="Annual volatility assumption (default 0.65 = 65%%)")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
     backtest(args.prices, args.entry_second, args.sweep, args.btc_vol, args.output,
-             orderbook_zips=args.orderbook)
+             orderbook_zips=args.orderbook, data_zip=args.data_zip, asset=args.asset)
