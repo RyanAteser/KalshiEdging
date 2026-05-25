@@ -464,70 +464,82 @@ def _print_price_x_dist_grid(df: pd.DataFrame, entry_second: int,
 
 # ── Orderbook loading ─────────────────────────────────────────────────────────
 
-def _process_ob_market(df: pd.DataFrame, sample_seconds: list[int]) -> dict | None:
-    """Extract price + volume at each entry second from an orderbook parquet."""
-    if "best_ask" not in df.columns or len(df) < 5:
-        return None
+# ── Paired prices + orderbook loading ────────────────────────────────────────
 
-    df = df.sort_values("time").reset_index(drop=True)
-    slug     = df["slug"].iloc[0]
-    open_ts  = df["time"].iloc[0]
-    date_str = open_ts.strftime("%Y-%m-%d")
-
-    # Settlement: final best_bid of the Up contract
-    final_bids = df["best_bid"].dropna()
-    if len(final_bids) == 0:
-        return None
-    last = float(final_bids.iloc[-1])
-    if last >= SETTLED_THRESH:
-        outcome_val = 1
-    elif last <= (1.0 - SETTLED_THRESH):
-        outcome_val = 0
-    else:
-        return None
-
-    row: dict = {"slug": slug, "date": date_str, "outcome": outcome_val}
-
-    for sec in sample_seconds:
-        target  = open_ts + pd.Timedelta(seconds=sec)
-        cands   = df[df["time"] <= target + pd.Timedelta(seconds=3)]
-        if cands.empty:
-            continue
-        er  = cands.iloc[-1]
-        ask = float(er["best_ask"]) if pd.notna(er["best_ask"]) else 0.0
-        if ask <= 0 or ask >= 1:
-            continue
-        row[f"px_{sec}"]     = ask
-        row[f"ask_sz_{sec}"] = float(er["top_ask_size"])  if pd.notna(er["top_ask_size"])  else 0.0
-        row[f"bid_sz_{sec}"] = float(er["top_bid_size"])  if pd.notna(er["top_bid_size"])  else 0.0
-        row[f"imb_{sec}"]    = float(er["ob_imbalance"])  if pd.notna(er["ob_imbalance"])  else 0.0
-        row[f"depth_{sec}"]  = (float(er["sum_ask_size"]) + float(er["sum_bid_size"])
-                                if pd.notna(er["sum_ask_size"]) else 0.0)
-
-    return row
-
-
-def _load_ob_zip(zip_path: str, sample_seconds: list[int]) -> list[dict]:
-    """Load an orderbook zip — one parquet per market."""
-    rows: list[dict] = []
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = sorted(n for n in zf.namelist() if n.endswith(".parquet"))
-        print(f"  {zip_path}: {len(names)} orderbook files")
-        for name in names:
-            if zf.getinfo(name).file_size == 0:
+def _load_paired_zips(prices_zip: str, ob_zip: str,
+                       sample_seconds: list[int]) -> list[dict]:
+    """
+    Load one prices zip + one orderbook zip together.
+    Settlement comes from prices (correct ~51% base rate).
+    Volume signals come from orderbook (ask_size, imbalance).
+    Joins by market open timestamp rounded to the nearest minute.
+    """
+    # ── prices: settlement + entry price ─────────────────────────────────────
+    price_rows: dict[int, dict] = {}
+    with zipfile.ZipFile(prices_zip, "r") as pzf:
+        pnames = sorted(n for n in pzf.namelist() if n.endswith(".parquet"))
+        for name in pnames:
+            if pzf.getinfo(name).file_size == 0:
                 continue
             try:
-                with zf.open(name) as fh:
-                    df = pd.read_parquet(io.BytesIO(fh.read()))
+                with pzf.open(name) as fh:
+                    pdf = pd.read_parquet(io.BytesIO(fh.read()))
             except Exception:
                 continue
-            row = _process_ob_market(df, sample_seconds)
-            if row is not None:
-                rows.append(row)
-            del df
+            if "time" not in pdf.columns:
+                continue
+            pdf = pdf.sort_values("time").reset_index(drop=True)
+            row = _process_market(pdf, sample_seconds)
+            if row is None:
+                continue
+            ts_key = int(pd.Timestamp(pdf["time"].iloc[0]).timestamp()) // 60
+            row["_ts"] = ts_key
+            price_rows[ts_key] = row
+        del pdf
+
+    # ── orderbook: volume at each entry second ────────────────────────────────
+    ob_rows: dict[int, dict] = {}
+    with zipfile.ZipFile(ob_zip, "r") as ozf:
+        onames = sorted(n for n in ozf.namelist() if n.endswith(".parquet"))
+        for name in onames:
+            if ozf.getinfo(name).file_size == 0:
+                continue
+            try:
+                with ozf.open(name) as fh:
+                    odf = pd.read_parquet(io.BytesIO(fh.read()))
+            except Exception:
+                continue
+            if "best_ask" not in odf.columns or len(odf) < 5:
+                continue
+            odf = odf.sort_values("time").reset_index(drop=True)
+            open_ts = odf["time"].iloc[0]
+            ts_key  = int(pd.Timestamp(open_ts).timestamp()) // 60
+
+            vol: dict = {}
+            for sec in sample_seconds:
+                target = open_ts + pd.Timedelta(seconds=sec)
+                cands  = odf[odf["time"] <= target + pd.Timedelta(seconds=3)]
+                if cands.empty:
+                    continue
+                er = cands.iloc[-1]
+                vol[f"ask_sz_{sec}"] = float(er["top_ask_size"]) if pd.notna(er.get("top_ask_size")) else 0.0
+                vol[f"bid_sz_{sec}"] = float(er["top_bid_size"]) if pd.notna(er.get("top_bid_size")) else 0.0
+                vol[f"imb_{sec}"]    = float(er["ob_imbalance"])  if pd.notna(er.get("ob_imbalance"))  else 0.0
+            ob_rows[ts_key] = vol
+        del odf
+
+    # ── join by timestamp key ─────────────────────────────────────────────────
+    merged: list[dict] = []
+    for ts_key, prow in price_rows.items():
+        if ts_key in ob_rows:
+            combined = {**prow, **ob_rows[ts_key]}
+            del combined["_ts"]
+            merged.append(combined)
+
+    pct = len(merged) / max(len(price_rows), 1) * 100
+    print(f"    prices={len(price_rows)}  ob={len(ob_rows)}  joined={len(merged)} ({pct:.0f}%)")
     gc.collect()
-    print(f"    → {len(rows)} settled Up-contracts extracted")
-    return rows
+    return merged
 
 
 # ── Volume analysis ───────────────────────────────────────────────────────────
@@ -668,23 +680,28 @@ def backtest(prices_zips: list[str], entry_second: int, sweep: bool,
              btc_vol: float, output_path: str | None,
              orderbook_zips: list[str] | None = None) -> None:
 
-    # ── Orderbook volume analysis (independent of prices) ────────────────────
-    if orderbook_zips:
-        print("\nLoading orderbook data for volume analysis …")
-        ob_rows: list[dict] = []
-        for zp in orderbook_zips:
-            ob_rows.extend(_load_ob_zip(zp, VOLUME_EARLY_SECS))
-        if ob_rows:
-            ob_df = pd.DataFrame(ob_rows)
-            n_up_ob = int((ob_df["outcome"] == 1).sum())
-            print(f"\nOrderbook dataset: {len(ob_df)} settled markets  "
-                  f"(Up={n_up_ob}  Down={len(ob_df)-n_up_ob}  base_rate={n_up_ob/len(ob_df):.1%})")
-            _print_volume_analysis(ob_df)
+    # ── Volume analysis: requires paired prices + orderbook ──────────────────
+    if orderbook_zips and prices_zips:
+        if len(prices_zips) != len(orderbook_zips):
+            print("Warning: --prices and --orderbook must have the same number of files "
+                  "(pair each prices zip with its matching orderbook zip by date).")
         else:
-            print("  No valid orderbook markets found.")
+            print("\nLoading paired prices + orderbook for volume analysis …")
+            paired: list[dict] = []
+            for pz, oz in zip(prices_zips, orderbook_zips):
+                print(f"  {Path(pz).name}  ↔  {Path(oz).name}")
+                paired.extend(_load_paired_zips(pz, oz, VOLUME_EARLY_SECS))
+            if paired:
+                paired_df = pd.DataFrame(paired)
+                n_up = int((paired_df["outcome"] == 1).sum())
+                print(f"\nPaired dataset: {len(paired_df)} markets  "
+                      f"(Up={n_up}  Down={len(paired_df)-n_up}  "
+                      f"base_rate={n_up/len(paired_df):.1%})")
+                _print_volume_analysis(paired_df)
+    elif orderbook_zips:
+        print("\nNote: --orderbook requires --prices to be provided too "
+              "(settlement outcome comes from the prices files).")
 
-    if not prices_zips:
-        return
 
     all_rows: list[dict] = []
     for zp in prices_zips:
