@@ -309,6 +309,9 @@ class RiskManager:
         # Mark locally so we don't double-buy during Kalshi API lag
         self._local_open_tickers.add(signal.ticker)
 
+        # Record entry for velocity filter — after confirmed fill only
+        self._sizer.note_entry()
+
         if self._shadow is not None:
             self._shadow.open(signal.ticker, kalshi_side, filled_price)
         if self._shadow_vol is not None:
