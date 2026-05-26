@@ -171,6 +171,64 @@ def adverse_move(side: str, btc_entry: float, btc_close: float) -> float:
     return max(move, 0.0)
 
 
+# ── Range regime helpers ──────────────────────────────────────────────
+
+def range_position(btc_entry: float, swing_low: float, swing_high: float, side: str) -> float:
+    """How far is BTC from the risky edge of the 2-hour range? (0–1 scale)
+
+    YES trades want BTC near the swing HIGH  (far from the strike below).
+    NO  trades want BTC near the swing LOW   (far from the strike above).
+
+    1.0 = BTC is at the ideal edge (max distance from danger).
+    0.0 = BTC is at the worst edge (touching the dangerous extreme).
+    0.5 = BTC is at the exact midpoint of the range.
+    """
+    rng = swing_high - swing_low
+    if rng < 1.0:
+        return 0.5
+    if side == "YES":
+        return (btc_entry - swing_low) / rng   # near high → 1.0
+    else:
+        return (swing_high - btc_entry) / rng  # near low  → 1.0
+
+
+def strike_inside_range(strike: float, swing_low: float, swing_high: float, side: str) -> bool:
+    """True if the strike is WITHIN the 2-hour swing range.
+
+    When True, BTC oscillating inside its normal range CAN reach the strike
+    without making a new extreme — this is the core ranging-market risk.
+
+    YES: dangerous when swing_low < strike  (range dips below the strike)
+    NO:  dangerous when swing_high > strike (range rises above the strike)
+    """
+    if side == "YES":
+        return swing_low < strike
+    else:
+        return swing_high > strike
+
+
+def safe_cushion(btc_entry: float, swing_low: float, swing_high: float,
+                 strike: float, side: str) -> float:
+    """How far can BTC move within its 2-hour range before reaching the strike?
+
+    YES: BTC can fall (btc_entry - swing_low) before hitting range floor.
+         Effective safe cushion = min of that fall vs distance to strike.
+    NO:  BTC can rise (swing_high - btc_entry) before hitting range ceiling.
+         Effective safe cushion = min of that rise vs distance to strike.
+
+    A positive value means BTC has room; negative means the range already
+    extends past the strike (high danger).
+    """
+    if side == "YES":
+        range_floor_room = btc_entry - swing_low   # how far BTC can fall in range
+        to_strike        = btc_entry - strike       # distance to strike
+        return min(range_floor_room, to_strike) - max(0.0, strike - swing_low)
+    else:
+        range_ceil_room = swing_high - btc_entry    # how far BTC can rise in range
+        to_strike       = strike - btc_entry        # distance to strike
+        return min(range_ceil_room, to_strike) - max(0.0, swing_high - strike)
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 def run(buffers: list[int]) -> None:
@@ -196,29 +254,44 @@ def run(buffers: list[int]) -> None:
         adv_move   = adverse_move(side, btc_entry, btc_close)
         margin     = abs(btc_entry - strike)   # BTC distance from market strike at entry
 
+        # ── Range regime metrics ───────────────────────────────────────
+        rng_pos    = range_position(btc_entry, swing_low, swing_high, side)
+        str_inside = strike_inside_range(strike, swing_low, swing_high, side)
+        saf_cush   = safe_cushion(btc_entry, swing_low, swing_high, strike, side)
+        # Settlement margin: how far BTC was from the strike at expiry
+        if side == "YES":
+            settle_margin = btc_close - strike
+        else:
+            settle_margin = strike - btc_close
+
         near_flags = {buf: (nearest is not None and nearest <= buf) for buf in buffers}
 
         print(
-            f"BTC={btc_entry:.0f}  range={fib_rng:.0f}  "
-            f"nearest_fib=${nearest:.1f}  adv_move=${adv_move:.0f}"
+            f"BTC={btc_entry:.0f}  range={fib_rng:.0f}  rng_pos={rng_pos:.2f}  "
+            f"str_inside={'Y' if str_inside else 'N'}  "
+            f"safe_cush=${saf_cush:.0f}  settle_margin=${settle_margin:.0f}"
         )
 
         results.append({
-            "id":          tid,
-            "side":        side,
-            "entry_px":    entry_px,
-            "strike":      strike,
-            "t_left":      t_left,
-            "entry_ts":    entry_ts,
-            "btc_entry":   btc_entry,
-            "btc_close":   btc_close,
-            "pnl":         pnl,
-            "swing_high":  swing_high,
-            "swing_low":   swing_low,
-            "fib_range":   fib_rng,
-            "nearest_fib": nearest,
-            "adverse_move": adv_move,
-            "margin":      margin,
+            "id":             tid,
+            "side":           side,
+            "entry_px":       entry_px,
+            "strike":         strike,
+            "t_left":         t_left,
+            "entry_ts":       entry_ts,
+            "btc_entry":      btc_entry,
+            "btc_close":      btc_close,
+            "pnl":            pnl,
+            "swing_high":     swing_high,
+            "swing_low":      swing_low,
+            "fib_range":      fib_rng,
+            "nearest_fib":    nearest,
+            "adverse_move":   adv_move,
+            "margin":         margin,
+            "range_position": round(rng_pos, 3),
+            "strike_inside_range": str_inside,
+            "safe_cushion":   round(saf_cush, 1),
+            "settle_margin":  round(settle_margin, 1),
             **{f"near_{b}": near_flags[b] for b in buffers},
         })
 
@@ -299,6 +372,80 @@ def run(buffers: list[int]) -> None:
               f"(filters {near_n}/{len(results)} = {near_n/len(results)*100:.0f}% of entries)")
     else:
         print("  → No clear buffer advantage found in this sample.")
+    print()
+
+    # ── Range regime analysis ─────────────────────────────────────────
+    NEAR_MISS_THRESHOLD = 150   # settlement margin below this = near-miss
+
+    near_misses  = [r for r in results if r["settle_margin"] < NEAR_MISS_THRESHOLD]
+    clean_wins   = [r for r in results if r["settle_margin"] >= NEAR_MISS_THRESHOLD]
+
+    def _avg(lst, key):
+        return sum(r[key] for r in lst) / len(lst) if lst else 0.0
+
+    def _pct(lst, key):
+        return sum(1 for r in lst if r[key]) / len(lst) * 100 if lst else 0.0
+
+    print(f"\n{'═'*75}")
+    print("  RANGE REGIME ANALYSIS")
+    print(f"  Near-misses = trades where BTC settled within ${NEAR_MISS_THRESHOLD} of strike")
+    print(f"{'─'*75}")
+    print(f"  {'Group':<30}  {'n':>4}  {'avg_rng_pos':>11}  {'str_inside%':>11}  "
+          f"{'avg_safe_cush':>13}  {'avg_fib_range':>13}")
+    print(f"  {'─'*30}──{'─'*4}──{'─'*11}──{'─'*11}──{'─'*13}──{'─'*13}")
+
+    for label, subset in [("Near-miss (settle<$150)", near_misses),
+                           ("Clean win  (settle≥$150)", clean_wins)]:
+        if not subset:
+            print(f"  {label}: — (no data)")
+            continue
+        n         = len(subset)
+        avg_rp    = _avg(subset, "range_position")
+        pct_si    = _pct(subset, "strike_inside_range")
+        avg_sc    = _avg(subset, "safe_cushion")
+        avg_fr    = _avg(subset, "fib_range")
+        print(f"  {label:<30}  {n:>4}  {avg_rp:>11.3f}  {pct_si:>10.1f}%  "
+              f"  {avg_sc:>11.1f}    {avg_fr:>11.1f}")
+
+    # Per-trade near-miss detail
+    if near_misses:
+        print(f"\n  Near-miss details (sorted by settle_margin):")
+        print(f"  {'id':>4}  {'side':>4}  {'entry_px':>8}  {'t_left':>6}  "
+              f"{'rng_pos':>7}  {'str_in':>6}  {'safe_cush':>9}  {'settle_margin':>13}  {'fib_range':>9}")
+        print(f"  {'─'*4}──{'─'*4}──{'─'*8}──{'─'*6}──{'─'*7}──{'─'*6}──{'─'*9}──{'─'*13}──{'─'*9}")
+        for r in sorted(near_misses, key=lambda x: x["settle_margin"]):
+            print(
+                f"  {r['id']:>4}  {r['side']:>4}  {r['entry_px']:>8.4f}  {r['t_left']:>6}  "
+                f"{r['range_position']:>7.3f}  {'Y' if r['strike_inside_range'] else 'N':>6}  "
+                f"  {r['safe_cushion']:>7.1f}  {r['settle_margin']:>13.1f}  {r['fib_range']:>9.1f}"
+            )
+
+    # ── Threshold sweep: find best range_position cutoff ──────────────
+    print(f"\n{'─'*75}")
+    print("  RANGE POSITION THRESHOLD SWEEP")
+    print("  Find the range_position cutoff that best separates near-misses.")
+    print(f"  {'Threshold':>9}  {'Blocked':>7}  {'Blk%':>5}  {'Near-miss caught':>16}  "
+          f"{'NM caught%':>10}  {'Clean wins kept':>15}  {'CW kept%':>8}")
+    print(f"  {'─'*9}──{'─'*7}──{'─'*5}──{'─'*16}──{'─'*10}──{'─'*15}──{'─'*8}")
+
+    for threshold in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+        blocked     = [r for r in results if r["range_position"] < threshold]
+        not_blocked = [r for r in results if r["range_position"] >= threshold]
+        nm_caught   = [r for r in blocked if r["settle_margin"] < NEAR_MISS_THRESHOLD]
+        cw_kept     = [r for r in not_blocked if r["settle_margin"] >= NEAR_MISS_THRESHOLD]
+        n_total     = len(results)
+        n_nm        = len(near_misses)
+        n_cw        = len(clean_wins)
+        print(
+            f"  {threshold:>9.2f}  {len(blocked):>7}  {len(blocked)/n_total*100:>4.1f}%"
+            f"  {len(nm_caught):>7}/{n_nm:<7}  {len(nm_caught)/n_nm*100 if n_nm else 0:>9.1f}%"
+            f"  {len(cw_kept):>7}/{n_cw:<7}  {len(cw_kept)/n_cw*100 if n_cw else 0:>7.1f}%"
+        )
+
+    print(f"\n  Interpretation:")
+    print(f"  Threshold = the range_position floor you require before entering.")
+    print(f"  Higher threshold = fewer entries but more near-misses avoided.")
+    print(f"  Optimal = highest threshold where clean_wins_kept% stays ≥ 80%.")
     print()
 
     # ── Write CSV ─────────────────────────────────────────────────────
