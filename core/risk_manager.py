@@ -370,25 +370,28 @@ class RiskManager:
         if not result.success:
             err_str = str(result.error or "").lower()
             if "market_closed" in err_str or "market closed" in err_str:
-                # Market settled before we could sell — treat as a settlement win.
-                # The poller would eventually do this, but doing it now re-arms the
-                # engine immediately so we can trade the next market without delay.
+                # Market settled before we could sell — record with correct side payout.
                 logger.warning(
                     "[%s] Sell blocked: market already closed — recording as settlement",
                     signal.ticker,
                 )
-                pnl = (1.0 - entry_price) * quantity
-                self._db.close_position(pos_id, exit_price=1.0, exit_reason="settlement", pnl=pnl)
+                market_result = self._db.get_market_result(signal.ticker)
+                if market_result is not None:
+                    settlement_payout = float(market_result) if kalshi_side == "YES" else 1.0 - float(market_result)
+                else:
+                    settlement_payout = 1.0
+                pnl = (settlement_payout - entry_price) * quantity
+                self._db.close_position(pos_id, exit_price=settlement_payout, exit_reason="settlement", pnl=pnl)
                 self._signal_engine.mark_position_closed(signal.ticker)
                 self._local_open_tickers.discard(signal.ticker)
                 self._sizer.record_result(pnl)
                 if self._shadow is not None:
-                    self._shadow.close_all(signal.ticker, 1.0, "settlement")
+                    self._shadow.close_all(signal.ticker, settlement_payout, "settlement")
                 if self._shadow_vol is not None:
-                    self._shadow_vol.close_all(signal.ticker, 1.0, "settlement")
+                    self._shadow_vol.close_all(signal.ticker, settlement_payout, "settlement")
                 event_bus.push_trade(TradeEvent(
                     ticker=signal.ticker, side="SELL",
-                    price=1.0, qty=quantity, pnl=pnl,
+                    price=settlement_payout, qty=quantity, pnl=pnl,
                 ))
             else:
                 logger.error("[%s] Sell failed: %s", signal.ticker, result.error)

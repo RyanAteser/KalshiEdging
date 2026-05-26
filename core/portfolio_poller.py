@@ -188,22 +188,36 @@ class PortfolioPoller(threading.Thread):
             pos_id      = position["id"]
             entry_price = position["entry_price"]
             qty         = position["quantity"]
+            side        = position.get("side", "YES")
 
-            # Settled = win ($1 payout)
-            pnl = (1.0 - entry_price) * qty
-            self._db.close_position(pos_id, exit_price=1.0, exit_reason="settlement", pnl=pnl)
+            # Fetch actual market result so NO wins are recorded correctly.
+            # result=1 means YES won; result=0 means NO won.
+            # Fallback to assuming a win if the market result isn't recorded yet.
+            market_result = self._db.get_market_result(ticker)
+            if market_result is not None:
+                settlement_payout = float(market_result) if side == "YES" else 1.0 - float(market_result)
+            else:
+                settlement_payout = 1.0  # optimistic fallback (position gone = likely settled)
+
+            pnl = (settlement_payout - entry_price) * qty
+            self._db.close_position(
+                pos_id,
+                exit_price=settlement_payout,
+                exit_reason="settlement",
+                pnl=pnl,
+            )
             if self._sizer:
                 self._sizer.record_result(pnl)
             if self._shadow is not None:
-                self._shadow.close_all(ticker, 1.0, "settlement")
+                self._shadow.close_all(ticker, settlement_payout, "settlement")
 
             logger.info(
-                "[%s] Closed: entry=%.4f qty=%d pnl=+%.4f (assumed settlement)",
-                ticker, entry_price, qty, pnl,
+                "[%s] Closed: side=%s entry=%.4f payout=%.1f qty=%d pnl=%+.4f",
+                ticker, side, entry_price, settlement_payout, qty, pnl,
             )
             event_bus.push_trade(TradeEvent(
                 ticker=ticker, side="SELL",
-                price=1.0, qty=qty, pnl=pnl,
+                price=settlement_payout, qty=qty, pnl=pnl,
             ))
 
         except Exception as exc:
