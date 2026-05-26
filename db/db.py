@@ -435,6 +435,13 @@ class Database:
         row = self.fetchone("SELECT id FROM markets WHERE ticker = ?", (ticker,))
         return row[0]
 
+    def get_market_result(self, ticker: str) -> Optional[int]:
+        """Return the YES settlement result (1=YES won, 0=NO won) or None if not yet recorded."""
+        row = self.fetchone("SELECT result FROM markets WHERE ticker = ?", (ticker,))
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
     def update_market_result(
         self, ticker: str, result: int, settlement_price: Optional[float] = None
     ) -> None:
