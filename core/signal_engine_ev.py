@@ -108,7 +108,7 @@ class EVMarketState:
 
         # Cooldown / lockouts
         self.cooldown_until:    float = 0.0
-        self.market_open_until: float = time.time() + MARKET_OPEN_LOCKOUT
+        self.market_open_until: float = 0.0   # set on first live tick; stays 0 in backtest
 
         # Simulation time override (backtest only)
         self.sim_time: Optional[float] = None
@@ -187,7 +187,8 @@ class EVSignalEngine:
             st.stop_price      = None
             st.position_id     = None
             st.position_side   = None
-            st.cooldown_until  = time.time() + POST_CLOSE_COOLDOWN
+            now = st.sim_time if st.sim_time is not None else time.time()
+            st.cooldown_until  = now + POST_CLOSE_COOLDOWN
         logger.info("[EV] CLOSED: %s — cooling down %.0fs", ticker, POST_CLOSE_COOLDOWN)
 
     def update_market_context(
@@ -262,7 +263,11 @@ class EVSignalEngine:
             if st.has_position:
                 return None   # hold to expiry — poller handles settlement close
 
-            now = time.time()
+            # Use sim_time when replaying history; fall back to wall clock for live trading.
+            now = st.sim_time if st.sim_time is not None else time.time()
+            # Live trading: arm the market-open lockout on the first real tick.
+            if sim_time is None and st.market_open_until == 0.0:
+                st.market_open_until = time.time() + MARKET_OPEN_LOCKOUT
             if st.pending_entry or now < st.cooldown_until:
                 return None
             if now < st.market_open_until:
