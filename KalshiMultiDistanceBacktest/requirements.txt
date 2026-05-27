@@ -1,0 +1,7 @@
+pandas
+numpy
+scipy
+requests
+pyarrow
+python-dotenv
+pykalshi
