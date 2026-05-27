@@ -340,9 +340,6 @@ def save_kalshi_series(asset_cfg: dict, days: int = 30, out_dir: str = "data") -
     """
     from pykalshi import KalshiClient
     from pykalshi.enums import CandlestickPeriod
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    import config as cfg
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     series     = asset_cfg["kalshi_series"]
@@ -350,11 +347,7 @@ def save_kalshi_series(asset_cfg: dict, days: int = 30, out_dir: str = "data") -
     out_path   = Path(out_dir) / f"kalshi_{series.lower()}.parquet"
 
     try:
-        client = KalshiClient(
-            key_id       = cfg.KALSHI_API_KEY_ID,
-            private_key  = cfg.KALSHI_PRIVATE_KEY_PATH,
-            environment  = cfg.KALSHI_ENV,
-        )
+        client = KalshiClient.from_env()
     except Exception as exc:
         logger.error("Kalshi client init failed: %s", exc)
         raise
