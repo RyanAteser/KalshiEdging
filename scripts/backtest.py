@@ -247,19 +247,25 @@ def fetch_settled_markets(
                    "close_time_ts", "closeTime", "settle_time")
             )
 
-            # Extract BTC strike threshold (NOT the settlement price).
-            # Priority: subtitle > ticker regex > floor_strike/cap_strike (last resort —
-            # on settled markets these fields return the actual BTC settlement price, e.g.
-            # 75128.34, not the binary threshold, e.g. 75000).
+            # Extract btc_target — the reference BTC price for this market.
+            # New KXBTC15M format: subtitle = "Target Price: $75,155.74" where the
+            # value is the BTC opening price when the market started.  The market
+            # resolves YES if BTC closes ABOVE this price.  The distance filter then
+            # measures how far BTC has drifted from open — useful for momentum entry.
+            # Old format had a round threshold (e.g. "Above $75,000").  Both are
+            # handled by the dollar-amount regex below.
             btc_target: Optional[float] = None
 
-            # 1) Parse subtitle string (e.g. "Above $75,000" → 75000)
+            # 1) Parse subtitle string.
+            # New format: "Target Price: $75,155.74"  → 75155.74  (opening BTC price)
+            # Old format: "Above $75,000"             → 75000.0   (round threshold)
             subtitle_raw = _g(m, "yes_sub_title", "subtitle")
             if subtitle_raw is not None:
                 try:
-                    clean = re.sub(r"[^0-9]", "", str(subtitle_raw))
-                    if clean:
-                        val = float(clean)
+                    # Match a dollar amount preserving the decimal point
+                    dm = re.search(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?)", str(subtitle_raw))
+                    if dm:
+                        val = float(dm.group(1).replace(",", ""))
                         if 10_000 <= val <= 999_999:
                             btc_target = val
                 except (ValueError, TypeError):
@@ -538,7 +544,7 @@ def _determine_settlement(
     kalshi_candles: list,
 ) -> bool:
     """
-    Return True if YES resolved (BTC was above target at close).
+    Return True if YES resolved (BTC closed above btc_target, i.e. the opening price).
     First tries Binance klines at close_ts; falls back to last Kalshi price.
     """
     close_minute = (close_ts // 60) * 60
