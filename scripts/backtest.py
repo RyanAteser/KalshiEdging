@@ -247,33 +247,45 @@ def fetch_settled_markets(
                    "close_time_ts", "closeTime", "settle_time")
             )
 
-            # Extract BTC strike — floor_strike/cap_strike are direct floats on settled markets
+            # Extract BTC strike threshold (NOT the settlement price).
+            # Priority: subtitle > ticker regex > floor_strike/cap_strike (last resort —
+            # on settled markets these fields return the actual BTC settlement price, e.g.
+            # 75128.34, not the binary threshold, e.g. 75000).
             btc_target: Optional[float] = None
-            num_strike = _g(m, "floor_strike", "cap_strike")
-            if num_strike is not None:
+
+            # 1) Parse subtitle string (e.g. "Above $75,000" → 75000)
+            subtitle_raw = _g(m, "yes_sub_title", "subtitle")
+            if subtitle_raw is not None:
                 try:
-                    val = float(num_strike)
-                    if 10_000 <= val <= 999_999:   # realistic BTC price range
-                        btc_target = val
+                    clean = re.sub(r"[^0-9]", "", str(subtitle_raw))
+                    if clean:
+                        val = float(clean)
+                        if 10_000 <= val <= 999_999:
+                            btc_target = val
                 except (ValueError, TypeError):
                     pass
-            # Fallback: parse subtitle string (e.g. "Above $104,000")
-            if btc_target is None:
-                subtitle_raw = _g(m, "yes_sub_title", "subtitle")
-                if subtitle_raw is not None:
-                    try:
-                        clean = re.sub(r"[^0-9]", "", str(subtitle_raw))
-                        if clean:
-                            val = float(clean)
-                            if 10_000 <= val <= 999_999:
-                                btc_target = val
-                    except (ValueError, TypeError):
-                        pass
-            # Final fallback: regex on the ticker string itself
+
+            # 2) Ticker regex (old format: KXBTC15M-23OCT0314-T64000)
             if btc_target is None:
                 btc_target = extract_btc_target(ticker)
 
+            # 3) Last resort: floor_strike/cap_strike — only trust round numbers
+            if btc_target is None:
+                num_strike = _g(m, "floor_strike", "cap_strike")
+                if num_strike is not None:
+                    try:
+                        val = float(num_strike)
+                        # Only accept values that look like a round strike (multiple of 500)
+                        if 10_000 <= val <= 999_999 and val % 500 == 0:
+                            btc_target = val
+                    except (ValueError, TypeError):
+                        pass
+
             if close_ts and close_ts >= start_ts:
+                if btc_target is None:
+                    logger.warning("No btc_target for %s (subtitle=%r)", ticker, subtitle_raw)
+                else:
+                    logger.debug("Market %s → btc_target=%.0f", ticker, btc_target)
                 markets.append({"ticker": ticker, "close_ts": close_ts,
                                 "btc_target": btc_target})
 
