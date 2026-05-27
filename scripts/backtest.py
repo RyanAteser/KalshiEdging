@@ -67,11 +67,14 @@ BTC_SERIES           = "KXBTC15M"
 
 class BacktestConfig:
     def __init__(self, args):
-        self.ev_grid_min  = args.grid_min
-        self.ev_grid_max  = args.grid_max
-        self.ev_min_entry = args.min_ev
-        self.ev_min_exit  = args.min_exit_ev
-        self.ev_fee_rate  = args.fee_rate
+        self.ev_grid_min      = args.grid_min
+        self.ev_grid_max      = args.grid_max
+        self.ev_min_entry     = args.min_ev
+        self.ev_min_exit      = args.min_exit_ev
+        self.ev_fee_rate      = args.fee_rate
+        self.ev_min_btc_dist  = args.min_dist
+        self.ev_ml_dist_floor = args.ml_dist_floor
+        self.ev_ml_min_prob   = args.ml_min_prob
 
 
 # ── Mock data feeds ───────────────────────────────────────────────────────
@@ -422,7 +425,7 @@ def run_market_backtest(
     btc_feed     = MockBtcFeed(candles_15m)
     futures_feed = MockBinanceFuturesFeed()
 
-    engine    = EVSignalEngine(config, btc_feed, binance_feed, futures_feed)
+    engine    = EVSignalEngine(config, btc_feed, binance_feed)
     market_id = abs(hash(ticker)) % 1_000_000
 
     # Create state and set BTC 15m context
@@ -646,6 +649,24 @@ def print_results(trades: List[BacktestTrade], days: int, args) -> None:
                       f"{gw / len(group) * 100:>5.1f}% win  "
                       f"{sum(t.pnl for t in group) / len(group):>+.5f} avg")
 
+    # Distance-tier breakdown — shows win rate at each $distance bucket
+    # This is the key table for validating the ML gate vs the old hard threshold.
+    dist_vals = [t.features.get("btc_dist_dollars") for t in trades]
+    if any(v is not None and v > 0 for v in dist_vals):
+        TIERS = [(0, 75), (75, 150), (150, 250), (250, 400), (400, float("inf"))]
+        print(f"\n  Distance-tier breakdown (btc_dist_dollars):")
+        print(f"    {'Range ($)':<18}  {'Trades':>6}  {'Win%':>6}  {'Avg PnL':>8}")
+        for lo, hi in TIERS:
+            bucket = [t for t, v in zip(trades, dist_vals)
+                      if v is not None and lo <= v < hi]
+            if not bucket:
+                continue
+            bw = sum(1 for t in bucket if t.outcome == 1)
+            ba = sum(t.pnl for t in bucket) / len(bucket)
+            hi_str = f"{hi:.0f}" if hi != float("inf") else "∞"
+            print(f"    {lo:>5}–{hi_str:<11}  {len(bucket):>6}  "
+                  f"{bw / len(bucket) * 100:>5.1f}%  {ba:>+.5f}")
+
     # Feature correlations — direction-signed so YES and NO trades are comparable:
     # For NO trades, features that predict YES are negated (they predict the opposite outcome).
     _DIRECTIONAL = frozenset({
@@ -697,6 +718,12 @@ def main() -> None:
                         help="Grid upper price bound")
     parser.add_argument("--fee-rate",     type=float, default=0.007,
                         help="Fee rate for EV formula")
+    parser.add_argument("--min-dist",      type=float, default=200.0,
+                        help="Min BTC-to-strike distance ($) used when no ML model is loaded (0=disabled)")
+    parser.add_argument("--ml-dist-floor", type=float, default=50.0,
+                        help="Soft distance floor ($) used instead of --min-dist when ML model is active")
+    parser.add_argument("--ml-min-prob",   type=float, default=0.55,
+                        help="Min ML p_model required for entry when ML is active (0=disabled)")
     parser.add_argument("--slippage",        type=float, default=0.005,
                         help="One-way fill slippage added to entry price (e.g. 0.005 = 0.5¢)")
     parser.add_argument("--no-stop-loss",   action="store_true",

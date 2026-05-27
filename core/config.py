@@ -33,7 +33,9 @@ class Config:
     ev_fee_rate:  float   # Kalshi fee approximation for EV formula (e.g. 0.007)
 
     # Early-entry distance strategy (backtest-derived: t=180–600s, dist≥$200)
-    ev_min_btc_dist:      float  # min actual $ dist of BTC from strike (0 = disabled)
+    ev_min_btc_dist:      float  # min actual $ dist of BTC from strike — fallback when no ML model (0 = disabled)
+    ev_ml_dist_floor:     float  # distance floor used instead of ev_min_btc_dist when ML model is loaded
+    ev_ml_min_prob:       float  # min ML-estimated P(win) required for entry — gate that replaces hard distance tiers
     ev_entry_min_seconds: float  # earliest entry (seconds elapsed since market open)
     ev_entry_max_seconds: float  # latest entry (0 = no limit)
 
@@ -79,6 +81,8 @@ def load_config() -> Config:
         ev_min_exit=get_float("EV_MIN_EXIT", -0.003),
         ev_fee_rate=get_float("EV_FEE_RATE", 0.007),
         ev_min_btc_dist=get_float("EV_MIN_BTC_DIST", 200.0),
+        ev_ml_dist_floor=get_float("EV_ML_DIST_FLOOR", 50.0),
+        ev_ml_min_prob=get_float("EV_ML_MIN_PROB", 0.55),
         ev_entry_min_seconds=get_float("EV_ENTRY_MIN_SECONDS", 180.0),
         ev_entry_max_seconds=get_float("EV_ENTRY_MAX_SECONDS", 600.0),
         max_markets=get_int("MAX_MARKETS", 10),

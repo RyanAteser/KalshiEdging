@@ -599,9 +599,12 @@ class EVSignalEngine:
                 )
                 return None
 
-        # Distance filter: BTC must be far enough from strike in the trade direction
+        # Distance filter — when ML model is loaded we use a soft floor (ev_ml_dist_floor)
+        # so the ML probability gate does the real work; without ML we keep the full threshold.
         btc_price = self._bfeed.mid_price
-        min_dist = cfg.ev_min_btc_dist
+        predictor_active = _get_ml_predictor() is not None
+        min_dist = cfg.ev_ml_dist_floor if predictor_active else cfg.ev_min_btc_dist
+        actual_dist: float = 0.0
         if btc_price and st.btc_target and min_dist > 0:
             actual_dist = btc_price - st.btc_target   # + = BTC above strike
             if actual_dist < min_dist:                 # BTC not far enough above → no YES
@@ -610,13 +613,23 @@ class EVSignalEngine:
                 no_in_grid = False
             if not yes_in_grid and not no_in_grid:
                 logger.debug(
-                    "[EV] %s dist filter: BTC %.0f vs strike %.0f (dist=%.0f, min=%.0f)",
-                    ticker, btc_price, st.btc_target, actual_dist, min_dist,
+                    "[EV] %s dist filter: BTC %.0f vs strike %.0f (dist=%.0f, min=%.0f, ml=%s)",
+                    ticker, btc_price, st.btc_target, actual_dist, min_dist, predictor_active,
                 )
                 return None
 
         volume          = st.volume_history[-1] if st.volume_history else None
         p_model, feats  = self._compute_p_model(st, price, best_bid, best_ask, volume)
+
+        # ML probability gate — when the model is loaded it replaces the hard distance tiers.
+        # Rejects trades where the model is uncertain even if EV is technically positive.
+        if predictor_active and p_model < cfg.ev_ml_min_prob:
+            logger.debug(
+                "[EV] %s ML prob gate: p=%.4f < min=%.4f",
+                ticker, p_model, cfg.ev_ml_min_prob,
+            )
+            return None
+
         fee             = cfg.ev_fee_rate
 
         ev_yes = self._ev_yes(p_model, best_ask, fee) if yes_in_grid else -999.0
@@ -643,9 +656,10 @@ class EVSignalEngine:
             "ev": ev,
             "side": side,
             "entry_price": entry_px,
-            # New context fields for DB logging
             "spread": round(best_ask - best_bid, 6),
             "btc_target": st.btc_target,
+            "btc_dist_dollars": round(abs(actual_dist), 2),
+            "ml_active": predictor_active,
             "seconds_elapsed": seconds_elapsed,
             "seconds_remaining": seconds_remaining,
             "tick_count": len(st.price_history),
