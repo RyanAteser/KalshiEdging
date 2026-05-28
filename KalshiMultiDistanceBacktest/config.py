@@ -40,8 +40,8 @@ ASSETS = {
         "kraken_pair":    "SOLUSD",
         "annual_vol":     1.10,
         "min_strike":     5.0,
-        "thresholds":     [0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00],
-        "stop_dist":      0.10,
+        "thresholds":     [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50],
+        "stop_dist":      0.02,
         "price_file":     "prices_sol_1m.parquet",
     },
     "XRP": {
