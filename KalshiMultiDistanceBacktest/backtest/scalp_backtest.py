@@ -16,16 +16,26 @@ Trade lifecycle per market:
          market settles      → pnl = outcome * (100 - buy_c) - (1 - outcome) * buy_c
                                i.e. +YES_pnl or -buy_c depending on resolution
 
+Multi-zone mode (--zones):
+  Runs multiple buy/sell/stop zones simultaneously on each market.
+  Each zone tracks its own state independently.
+  Zones are non-overlapping by design (e.g. 60:65, 75:80, 80:85).
+  A zone exit does NOT block the adjacent zone from triggering independently.
+  After exit from any zone, a 1-tick cooldown prevents immediate re-entry on
+  that same zone (avoids double-counting the exit tick as a new entry).
+
 Sweep modes:
   --sweep-buy    : fix spread, sweep buy_c from 5c to 95c in spread_c steps
   --sweep-spread : fix buy_c, sweep spread from 1c to 30c
 
 Usage (via main.py):
-  python main.py scalp --asset BTC --buy 60 --spread 5
-  python main.py scalp --asset BTC --buy 60 --spread 5 --stop 10
-  python main.py scalp --asset BTC --spread 5 --sweep-buy
-  python main.py scalp --asset BTC --buy 60 --sweep-spread
-  python main.py scalp --asset ETH --spread 5 --sweep-buy --stop 10
+  %PY% main.py scalp --asset BTC --buy 60 --spread 5
+  %PY% main.py scalp --asset BTC --buy 60 --spread 5 --stop 10
+  %PY% main.py scalp --asset BTC --spread 5 --sweep-buy
+  %PY% main.py scalp --asset BTC --buy 60 --sweep-spread
+  %PY% main.py scalp --asset ETH --spread 5 --sweep-buy --stop 10
+  %PY% main.py scalp --asset BTC --zones 60:65,75:80,80:85 --stop 5
+  %PY% main.py scalp --asset BTC --zones 60:65,75:80,80:85 --stop 5 --contracts 1
 """
 
 from __future__ import annotations
@@ -190,6 +200,232 @@ def run_sweep_spread(
         r = run_scalp_backtest(df, buy_c, sell_c, stop_c=stop_c, tol_c=tol_c)
         rows.append(r)
     return pd.DataFrame(rows)
+
+
+# ── Multi-zone simulation ──────────────────────────────────────────────────
+
+def parse_zones(zones_str: str, stop_c: int, tol_c: int) -> list[dict]:
+    """
+    Parse '--zones 60:65,75:80,80:85' into zone config dicts.
+    Each zone: {buy, sell, stop, tol}  (all in [0,1] floats)
+    stop_c applies to all zones; pass 0 for no stop.
+    """
+    zones = []
+    for part in zones_str.split(","):
+        part = part.strip()
+        if ":" not in part:
+            raise ValueError(f"Zone must be 'buy:sell', got: {part!r}")
+        b, s = part.split(":", 1)
+        buy_c  = int(b)
+        sell_c = int(s)
+        spread_c = sell_c - buy_c
+        if spread_c <= 0:
+            raise ValueError(f"sell must be > buy in zone {part!r}")
+        zones.append({
+            "buy_c":    buy_c,
+            "sell_c":   sell_c,
+            "stop_c":   stop_c,
+            "spread_c": spread_c,
+            "buy":   buy_c  / 100.0,
+            "sell":  sell_c / 100.0,
+            "stop":  (buy_c - stop_c) / 100.0 if stop_c > 0 else -1.0,
+            "tol":   tol_c  / 100.0,
+        })
+    return zones
+
+
+def _simulate_market_multizone(
+    ticks: pd.DataFrame,
+    zones: list[dict],
+) -> list[dict]:
+    """
+    Simulate all zones simultaneously on one market.
+    Each zone has independent state. 1-tick cooldown after any exit.
+    Returns flat list of trade dicts, each tagged with zone index.
+    """
+    outcome = int(ticks["outcome"].iloc[-1])
+    asks    = ticks["ask"].values
+
+    # Per-zone state
+    n = len(zones)
+    in_trade    = [False] * n
+    entry_ask   = [0.0]   * n
+    cooldown    = [0]     * n   # ticks remaining before zone can re-enter
+
+    all_trades: list[dict] = []
+
+    for ask in asks:
+        if ask != ask:  # NaN check
+            continue
+
+        for i, z in enumerate(zones):
+            if cooldown[i] > 0:
+                cooldown[i] -= 1
+                continue
+
+            if not in_trade[i]:
+                if abs(ask - z["buy"]) <= z["tol"]:
+                    in_trade[i]  = True
+                    entry_ask[i] = ask
+            else:
+                if ask >= z["sell"]:
+                    all_trades.append({
+                        "zone": i, "result": "hit",
+                        "entry": entry_ask[i],
+                        "buy_c": z["buy_c"], "sell_c": z["sell_c"], "stop_c": z["stop_c"],
+                    })
+                    in_trade[i] = False
+                    cooldown[i] = 1
+                elif z["stop"] >= 0 and ask <= z["stop"]:
+                    all_trades.append({
+                        "zone": i, "result": "stopped",
+                        "entry": entry_ask[i],
+                        "buy_c": z["buy_c"], "sell_c": z["sell_c"], "stop_c": z["stop_c"],
+                    })
+                    in_trade[i] = False
+                    cooldown[i] = 1
+
+    # Any zones still open at settlement
+    for i, z in enumerate(zones):
+        if in_trade[i]:
+            all_trades.append({
+                "zone": i, "result": "settled", "outcome": outcome,
+                "entry": entry_ask[i],
+                "buy_c": z["buy_c"], "sell_c": z["sell_c"], "stop_c": z["stop_c"],
+            })
+
+    return all_trades
+
+
+def _pnl_multitrade(t: dict) -> float:
+    """PnL in cents for a multi-zone trade dict."""
+    if t["result"] == "hit":
+        return t["sell_c"] - t["buy_c"]
+    elif t["result"] == "stopped":
+        return -t["stop_c"]
+    else:
+        o = t.get("outcome", 0)
+        buy_c = t["buy_c"]
+        return o * (100 - buy_c) + (1 - o) * (-buy_c)
+
+
+def run_multizone_backtest(
+    df: pd.DataFrame,
+    zones: list[dict],
+    contracts: int = 1,
+) -> dict:
+    """
+    Run all zones simultaneously across every market.
+    Returns a summary dict + per-zone breakdown.
+    """
+    all_trades:          list[dict] = []
+    market_trade_counts: list[int]  = []
+    markets_with_entry = 0
+
+    for _, mkt in df.groupby("ticker"):
+        mkt    = mkt.sort_values("tick_time").reset_index(drop=True)
+        trades = _simulate_market_multizone(mkt, zones)
+        if trades:
+            markets_with_entry += 1
+            market_trade_counts.append(len(trades))
+            all_trades.extend(trades)
+
+    n = len(all_trades)
+    if n == 0:
+        return {"total_trades": 0, "markets": 0, "trades_per_mkt": 0.0,
+                "exp_pnl_c": 0.0, "total_pnl_c": 0.0, "per_zone": []}
+
+    pnls   = [_pnl_multitrade(t) * contracts for t in all_trades]
+    hits   = sum(1 for t in all_trades if t["result"] == "hit")
+    stops  = sum(1 for t in all_trades if t["result"] == "stopped")
+    settld = sum(1 for t in all_trades if t["result"] == "settled")
+    avg_per_mkt = sum(market_trade_counts) / len(market_trade_counts)
+
+    # Per-zone breakdown
+    per_zone = []
+    for i, z in enumerate(zones):
+        zt = [t for t in all_trades if t["zone"] == i]
+        if not zt:
+            per_zone.append(None)
+            continue
+        zp   = [_pnl_multitrade(t) * contracts for t in zt]
+        zh   = sum(1 for t in zt if t["result"] == "hit")
+        zs   = sum(1 for t in zt if t["result"] == "stopped")
+        per_zone.append({
+            "buy_c": z["buy_c"], "sell_c": z["sell_c"], "stop_c": z["stop_c"],
+            "trades":    len(zt),
+            "hit%":      round(zh / len(zt) * 100, 1),
+            "stop%":     round(zs / len(zt) * 100, 1),
+            "exp_pnl_c": round(sum(zp) / len(zt), 2),
+            "total_pnl_c": round(sum(zp), 1),
+        })
+
+    return {
+        "total_trades":   n,
+        "markets":        markets_with_entry,
+        "trades_per_mkt": round(avg_per_mkt, 2),
+        "hit%":           round(hits   / n * 100, 1),
+        "stop%":          round(stops  / n * 100, 1),
+        "settled%":       round(settld / n * 100, 1),
+        "exp_pnl_c":      round(sum(pnls) / n, 2),
+        "total_pnl_c":    round(sum(pnls), 1),
+        "contracts":      contracts,
+        "per_zone":       per_zone,
+    }
+
+
+def print_multizone_results(r: dict, asset: str, zones: list[dict]) -> None:
+    if r["total_trades"] == 0:
+        print("  No trades triggered across any zone.")
+        return
+
+    contracts = r["contracts"]
+    zone_str  = "  ".join(f"{z['buy_c']}c→{z['sell_c']}c" for z in zones)
+    stop_c    = zones[0]["stop_c"]
+    stop_str  = f"stop={stop_c}c" if stop_c else "no stop"
+    dollar_pnl = r["total_pnl_c"] / 100 * contracts
+
+    print(f"\n{'='*72}")
+    print(f"  MULTI-ZONE SCALP — {asset}   {stop_str}   contracts={contracts}")
+    print(f"  Zones: {zone_str}")
+    print(f"{'='*72}")
+    print(f"  total trades    : {r['total_trades']:,}  across {r['markets']} markets")
+    print(f"  trades / market : {r['trades_per_mkt']:.2f}  ← combined across all zones")
+    print(f"  hit%            : {r['hit%']:.1f}%")
+    print(f"  stop%           : {r['stop%']:.1f}%")
+    print(f"  settled%        : {r['settled%']:.1f}%")
+    print(f"  exp_pnl         : {r['exp_pnl_c']:+.2f}c / trade")
+    print(f"  total pnl       : {r['total_pnl_c']:+.1f}c  (${dollar_pnl:+.2f})")
+    print()
+    print(f"  Per-zone breakdown:")
+    print(f"  {'zone':>10}  {'trades':>7}  {'hit%':>6}  {'stop%':>6}  {'exp_pnl_c':>10}  {'total_pnl':>10}")
+    print(f"  {'─'*10}  {'─'*7}  {'─'*6}  {'─'*6}  {'─'*10}  {'─'*10}")
+    for z_summary in r["per_zone"]:
+        if z_summary is None:
+            continue
+        flag = " ◀" if z_summary["exp_pnl_c"] > 0 else ""
+        print(
+            f"  {z_summary['buy_c']:>3}c→{z_summary['sell_c']:>3}c  "
+            f"{z_summary['trades']:>7,}  "
+            f"{z_summary['hit%']:>5.1f}%  {z_summary['stop%']:>5.1f}%  "
+            f"{z_summary['exp_pnl_c']:>+9.2f}c  "
+            f"{z_summary['total_pnl_c']:>+9.1f}c{flag}"
+        )
+
+    # $1 live trading guide
+    max_concurrent = 1  # zones are sequential by price, 1 active at a time
+    margin_needed  = max(z["buy_c"] for z in zones) / 100 * contracts
+    risk_per_trade = stop_c / 100 * contracts if stop_c else "N/A"
+    reward_per_trade = min(z["sell_c"] - z["buy_c"] for z in zones) / 100 * contracts
+
+    print()
+    print(f"  $1 live trading guide ({contracts} contract/zone):")
+    print(f"  Max capital at risk at once : ${margin_needed:.2f}  (worst case = 1 trade open)")
+    if stop_c:
+        print(f"  Risk per trade              : ${risk_per_trade:.2f}")
+        print(f"  Reward per trade            : ${reward_per_trade:.2f}")
+        print(f"  R:R ratio                   : 1:{reward_per_trade / risk_per_trade:.1f}")
+    print()
 
 
 # ── Printing ───────────────────────────────────────────────────────────────
