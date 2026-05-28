@@ -62,8 +62,8 @@ ASSETS = {
         "kraken_pair":    "XDGUSD",
         "annual_vol":     1.20,
         "min_strike":     0.005,
-        "thresholds":     [0.001, 0.002, 0.003, 0.005, 0.007, 0.010, 0.015],
-        "stop_dist":      0.0005,
+        "thresholds":     [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0007, 0.001],
+        "stop_dist":      0.00003,
         "price_file":     "prices_doge_1m.parquet",
     },
     "BNB": {
