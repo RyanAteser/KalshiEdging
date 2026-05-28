@@ -22,6 +22,17 @@ KALSHI_ENV              = os.getenv("KALSHI_ENV", "prod")
 # price_file:       Filename for cached 1m OHLCV parquet
 
 ASSETS = {
+    "BTC": {
+        "kalshi_series":  "KXBTC15M",
+        "coinbase_pair":  "BTC-USD",
+        "binance_symbol": "BTCUSDT",
+        "kraken_pair":    "XBTUSD",
+        "annual_vol":     0.60,
+        "min_strike":     10000.0,
+        "thresholds":     [100, 150, 200, 250, 300, 400, 500],
+        "stop_dist":      30.0,
+        "price_file":     "prices_btc_1m.parquet",
+    },
     "ETH": {
         "kalshi_series":  "KXETH15M",
         "coinbase_pair":  "ETH-USD",
