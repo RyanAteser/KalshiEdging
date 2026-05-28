@@ -162,13 +162,17 @@ def cmd_scalp(
     stop_c: int = 0,
     sweep_buy: bool = False,
     sweep_spread: bool = False,
+    zones_str: str = "",
+    contracts: int = 1,
     tol_c: int = 2,
 ):
     import pandas as pd
     from pathlib import Path
     from backtest.scalp_backtest import (
         run_scalp_backtest, run_sweep_buy, run_sweep_spread,
+        run_multizone_backtest, parse_zones,
         print_scalp_single, print_sweep_buy, print_sweep_spread,
+        print_multizone_results,
     )
 
     assets = [asset_filter] if asset_filter else ENABLED_ASSETS
@@ -184,7 +188,11 @@ def cmd_scalp(
         print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
               f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
 
-        if sweep_buy:
+        if zones_str:
+            zones = parse_zones(zones_str, stop_c=stop_c, tol_c=tol_c)
+            r = run_multizone_backtest(df, zones=zones, contracts=contracts)
+            print_multizone_results(r, name, zones)
+        elif sweep_buy:
             results = run_sweep_buy(df, spread_c=spread_c, stop_c=stop_c, tol_c=tol_c)
             print_sweep_buy(results, name, spread_c, stop_c)
         elif sweep_spread:
@@ -280,6 +288,22 @@ def main():
     sweep_buy    = "--sweep-buy"    in args
     sweep_spread = "--sweep-spread" in args
 
+    # Parse --zones 60:65,75:80,80:85
+    zones_str = ""
+    for i, a in enumerate(args):
+        if a.startswith("--zones="):
+            zones_str = a.split("=", 1)[1]; break
+        if a == "--zones" and i + 1 < len(args):
+            zones_str = args[i + 1]; break
+
+    # Parse --contracts N  (number of contracts per zone, default 1)
+    contracts = 1
+    for i, a in enumerate(args):
+        if a.startswith("--contracts="):
+            contracts = int(a.split("=", 1)[1]); break
+        if a == "--contracts" and i + 1 < len(args):
+            contracts = int(args[i + 1]); break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
@@ -294,7 +318,8 @@ def main():
     elif cmd == "scalp":
         cmd_scalp(
             asset, buy_c=buy_c, spread_c=spread_c, stop_c=stop_loss_c,
-            sweep_buy=sweep_buy, sweep_spread=sweep_spread, tol_c=tol_c,
+            sweep_buy=sweep_buy, sweep_spread=sweep_spread,
+            zones_str=zones_str, contracts=contracts, tol_c=tol_c,
         )
     else:
         print(__doc__)
