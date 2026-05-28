@@ -22,6 +22,12 @@ Usage:
   %PY% main.py scalp --asset BTC --spread 5 --sweep-buy        # sweep all buy prices
   %PY% main.py scalp --asset ETH --buy 60 --sweep-spread       # sweep all spreads
   %PY% main.py scalp --asset BTC --spread 5 --sweep-buy --stop 10
+
+  # RL agent — scalp/settle unified (learns when to exit vs hold to settlement)
+  %PY% main.py rl-train --asset BTC                         # train PPO agent
+  %PY% main.py rl-train --asset BTC --timesteps 500000      # longer training
+  %PY% main.py rl-eval  --asset BTC                         # evaluate on val set
+  %PY% main.py rl-eval  --asset BTC --verbose               # per-trade log
 """
 
 import sys
@@ -321,6 +327,46 @@ def main():
             sweep_buy=sweep_buy, sweep_spread=sweep_spread,
             zones_str=zones_str, contracts=contracts, tol_c=tol_c,
         )
+    elif cmd in ("rl-train", "rl-eval"):
+        import pandas as pd
+        from pathlib import Path
+
+        name = asset or "BTC"
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            sys.exit(1)
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            sys.exit(1)
+        df = pd.read_parquet(ds_path)
+        print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+              f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
+
+        # Parse --timesteps N
+        timesteps = 300_000
+        for i, a in enumerate(args):
+            if a.startswith("--timesteps="):
+                timesteps = int(a.split("=", 1)[1]); break
+            if a == "--timesteps" and i + 1 < len(args):
+                timesteps = int(args[i + 1]); break
+
+        # Parse --model path
+        model_path = "models"
+        for i, a in enumerate(args):
+            if a.startswith("--model="):
+                model_path = a.split("=", 1)[1]; break
+            if a == "--model" and i + 1 < len(args):
+                model_path = args[i + 1]; break
+
+        verbose_flag = "--verbose" in args
+
+        if cmd == "rl-train":
+            from rl.train import train
+            train(df, name, timesteps=timesteps, out_path=model_path)
+        else:
+            from rl.evaluate import evaluate
+            evaluate(df, name, model_path=model_path, verbose=verbose_flag)
     else:
         print(__doc__)
 
