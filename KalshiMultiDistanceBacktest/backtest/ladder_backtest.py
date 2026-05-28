@@ -8,6 +8,10 @@ Momentum filters (look back `lookback_ticks` ticks before entry):
   from_above_c > 0  → NO  trade: ask fell from ≥ (entry + from_above_c)
   Both set          → trades both directions at each tier
 
+Multi-trade mode (multi_trade=True):
+  Re-enters after each exit — counts every round trip per market.
+  Cursor advances past the exit tick so trades never overlap.
+
 Four outcomes per trade (YES or NO, same pnl formula in either direction):
   hit_ticks   → pnl = +step_c
   stopped     → pnl = -stop_loss_c
@@ -19,6 +23,7 @@ Usage (via main.py):
   python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10
   python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10 --from-above 10
   python main.py ladder --asset ETH --sweep --stop 10 --from-below 10 --from-above 10
+  python main.py ladder --asset BTC --step 5 --stop 5 --multi
 """
 
 from __future__ import annotations
@@ -56,7 +61,103 @@ def _resolve_trade(
         else:
             if hits_target.any():
                 return "hit"
-        return "settled_yes" if outcome == 1 else "settled_no"  # consistent: settled_yes = market resolved YES
+        return "settled_yes" if outcome == 1 else "settled_no"
+
+
+def _find_exit_offset(
+    after_asks,
+    target: float,
+    stop_level: float,
+    stop_active: bool,
+    direction: str,
+) -> int:
+    """Return the index in after_asks where this trade exited.
+    Returns len(after_asks) if the trade held to settlement (no tick exit found).
+    """
+    if direction == "YES":
+        hits_target = after_asks >= target
+        if stop_active and stop_level > 0:
+            hits_stop = after_asks <= stop_level
+            either = hits_target | hits_stop
+            if either.any():
+                return int(either.argmax())
+        else:
+            if hits_target.any():
+                return int(hits_target.argmax())
+    else:
+        hits_target = after_asks <= target
+        if stop_active:
+            hits_stop = after_asks >= stop_level
+            either = hits_target | hits_stop
+            if either.any():
+                return int(either.argmax())
+        else:
+            if hits_target.any():
+                return int(hits_target.argmax())
+    return len(after_asks)
+
+
+def _multi_trade_side(
+    asks,           # full market ask array
+    outcome: int,
+    entry: float,
+    target: float,
+    stop_level: float,
+    stop_active: bool,
+    tolerance: float,
+    from_filter: float,   # from_below (YES) or from_above (NO); 0 = no filter
+    direction: str,
+    lookback_ticks: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Run all trades for one direction in one market using cursor advance.
+    Returns (n_trades, n_mkts, hit, stopped, s_yes, s_no).
+    n_mkts is 1 if any trade fired, 0 otherwise.
+    """
+    n_ticks = len(asks)
+    cursor = 0
+    hit = stopped = s_yes = s_no = 0
+    traded = False
+
+    while cursor < n_ticks:
+        window = asks[cursor:]
+        at_level = abs(window - entry) <= tolerance
+        if not at_level.any():
+            break
+        local = int(at_level.argmax())
+        idx = cursor + local
+
+        # Momentum filter
+        start = max(0, idx - lookback_ticks)
+        prior = asks[start:idx]
+        if direction == "YES":
+            qualifies = (from_filter == 0 or (len(prior) > 0 and (prior <= entry - from_filter).any()))
+        else:
+            qualifies = (from_filter == 0 or (len(prior) > 0 and (prior >= entry + from_filter).any()))
+
+        if qualifies:
+            after = asks[idx + 1:]
+            if len(after) == 0:
+                break
+            result = _resolve_trade(after, target, stop_level, stop_active, outcome, direction)
+            traded = True
+            if result == "hit":
+                hit += 1
+            elif result == "stopped":
+                stopped += 1
+            elif result == "settled_yes":
+                s_yes += 1
+            else:
+                s_no += 1
+
+            off = _find_exit_offset(after, target, stop_level, stop_active, direction)
+            if off >= len(after):   # settled → no more trades this market
+                break
+            cursor = idx + 1 + off + 1
+        else:
+            cursor = idx + 1
+
+    n_trades = hit + stopped + s_yes + s_no
+    return n_trades, (1 if traded else 0), hit, stopped, s_yes, s_no
 
 
 def run_ladder_backtest(
@@ -67,21 +168,23 @@ def run_ladder_backtest(
     from_below_c: int = 0,
     from_above_c: int = 0,
     lookback_ticks: int = 10,
+    multi_trade: bool = False,
 ) -> pd.DataFrame:
     """
     For each entry tier (step_c to 99c at step_c intervals):
       YES trades: ask near entry AND rose from ≤ (entry − from_below_c)
       NO  trades: ask near entry AND fell from ≥ (entry + from_above_c)
       (if from_below_c=0 and from_above_c=0: all ticks, YES trades only)
+
+    multi_trade=True: re-enter after each exit, counting every round trip.
     """
     step       = step_c / 100.0
     tolerance  = tolerance_c / 100.0
     stop_loss  = stop_loss_c / 100.0
     from_below = from_below_c / 100.0
     from_above = from_above_c / 100.0
-    do_yes     = True          # YES side: always on (unless only from_above set)
+    do_yes     = True
     do_no      = from_above_c > 0
-    # If only from_above is set (no from_below), suppress unfiltered YES trades
     if from_above_c > 0 and from_below_c == 0:
         do_yes = False
 
@@ -95,74 +198,92 @@ def run_ladder_backtest(
         if target_yes > 1.001:
             break
 
-        stop_yes   = (entry - stop_loss) if stop_loss > 0 else -1.0
-        stop_no    = (entry + stop_loss) if stop_loss > 0 else  2.0
+        stop_yes = (entry - stop_loss) if stop_loss > 0 else -1.0
+        stop_no  = (entry + stop_loss) if stop_loss > 0 else  2.0
 
-        # Counters: YES and NO tracked separately, combined at end
-        n_yes = 0;  yes_hit = 0;  yes_stop = 0;  yes_sy = 0;  yes_sn = 0
-        n_no  = 0;  no_hit  = 0;  no_stop  = 0;  no_sy  = 0;  no_sn  = 0
+        n_yes = 0; yes_hit = 0; yes_stop = 0; yes_sy = 0; yes_sn = 0; n_mkts_yes = 0
+        n_no  = 0; no_hit  = 0; no_stop  = 0; no_sy  = 0; no_sn  = 0; n_mkts_no  = 0
 
         for _, mkt in df.groupby("ticker"):
             mkt     = mkt.sort_values("tick_time").reset_index(drop=True)
             outcome = int(mkt["outcome"].iloc[-1])
-            elig    = mkt.index[abs(mkt["ask"] - entry) <= tolerance].tolist()
-            if not elig:
-                continue
 
-            yes_done = False
-            no_done  = False
+            if multi_trade:
+                asks = mkt["ask"].values
 
-            for idx in elig:
-                if yes_done and no_done:
-                    break
-
-                start = max(0, idx - lookback_ticks)
-                prior = mkt["ask"].iloc[start:idx].dropna().values
-                after_asks = mkt.iloc[idx + 1:]["ask"].values
-
-                # YES trade: price rose through entry from below
-                if do_yes and not yes_done:
-                    qualifies = (
-                        from_below == 0  # no filter
-                        or (len(prior) > 0 and (prior <= entry - from_below).any())
+                if do_yes:
+                    nt, nm, h, s, sy, sn = _multi_trade_side(
+                        asks, outcome, entry, target_yes, stop_yes,
+                        stop_loss > 0, tolerance, from_below, "YES", lookback_ticks,
                     )
-                    if qualifies:
-                        yes_done = True
-                        n_yes += 1
-                        result = _resolve_trade(
-                            after_asks, target_yes, stop_yes,
-                            stop_loss > 0, outcome, "YES"
-                        )
-                        if result == "hit":             yes_hit  += 1
-                        elif result == "stopped":       yes_stop += 1
-                        elif result == "settled_yes":   yes_sy   += 1
-                        else:                           yes_sn   += 1
+                    n_yes += nt; n_mkts_yes += nm
+                    yes_hit += h; yes_stop += s; yes_sy += sy; yes_sn += sn
 
-                # NO trade: price fell through entry from above
-                if do_no and not no_done and target_no >= 0:
-                    qualifies = (
-                        len(prior) > 0 and (prior >= entry + from_above).any()
+                if do_no and target_no >= 0:
+                    nt, nm, h, s, sy, sn = _multi_trade_side(
+                        asks, outcome, entry, target_no, stop_no,
+                        stop_loss > 0, tolerance, from_above, "NO", lookback_ticks,
                     )
-                    if qualifies:
-                        no_done = True
-                        n_no += 1
-                        result = _resolve_trade(
-                            after_asks, target_no, stop_no,
-                            stop_loss > 0, outcome, "NO"
+                    n_no += nt; n_mkts_no += nm
+                    no_hit += h; no_stop += s; no_sy += sy; no_sn += sn
+
+            else:
+                elig = mkt.index[abs(mkt["ask"] - entry) <= tolerance].tolist()
+                if not elig:
+                    continue
+
+                yes_done = False
+                no_done  = False
+
+                for idx in elig:
+                    if yes_done and no_done:
+                        break
+
+                    start      = max(0, idx - lookback_ticks)
+                    prior      = mkt["ask"].iloc[start:idx].dropna().values
+                    after_asks = mkt.iloc[idx + 1:]["ask"].values
+
+                    if do_yes and not yes_done:
+                        qualifies = (
+                            from_below == 0
+                            or (len(prior) > 0 and (prior <= entry - from_below).any())
                         )
-                        if result == "hit":             no_hit  += 1
-                        elif result == "stopped":       no_stop += 1
-                        elif result == "settled_yes":   no_sy   += 1
-                        else:                           no_sn   += 1
+                        if qualifies:
+                            yes_done = True
+                            n_yes += 1; n_mkts_yes += 1
+                            result = _resolve_trade(
+                                after_asks, target_yes, stop_yes,
+                                stop_loss > 0, outcome, "YES",
+                            )
+                            if result == "hit":           yes_hit  += 1
+                            elif result == "stopped":     yes_stop += 1
+                            elif result == "settled_yes": yes_sy   += 1
+                            else:                         yes_sn   += 1
+
+                    if do_no and not no_done and target_no >= 0:
+                        qualifies = (
+                            len(prior) > 0 and (prior >= entry + from_above).any()
+                        )
+                        if qualifies:
+                            no_done = True
+                            n_no += 1; n_mkts_no += 1
+                            result = _resolve_trade(
+                                after_asks, target_no, stop_no,
+                                stop_loss > 0, outcome, "NO",
+                            )
+                            if result == "hit":           no_hit  += 1
+                            elif result == "stopped":     no_stop += 1
+                            elif result == "settled_yes": no_sy   += 1
+                            else:                         no_sn   += 1
 
         n = n_yes + n_no
         if n == 0:
             continue
 
+        n_mkts    = max(n_mkts_yes, n_mkts_no, n_mkts_yes + n_mkts_no - 200)
         n_hit     = yes_hit  + no_hit
         n_stopped = yes_stop + no_stop
 
-        # Settlement pnl differs by side
         exp_pnl_c = (
             n_hit     / n * step_c
             + n_stopped / n * (-stop_loss_c)
@@ -175,7 +296,10 @@ def run_ladder_backtest(
         results.append({
             "entry_c":    entry_c,
             "target_c":   int(round(target_yes * 100)),
-            "markets":    n,
+            "n_mkts":     n_mkts_yes if do_yes else n_mkts_no,
+            "trades":     n,
+            "avg_t":      round(n / max(n_mkts_yes + n_mkts_no - min(n_mkts_yes, n_mkts_no), 1) if multi_trade else 1, 1)
+                          if multi_trade else None,
             "yes_trades": n_yes,
             "no_trades":  n_no,
             "hit_ticks":  n_hit,
@@ -198,6 +322,7 @@ def run_ladder_sweep(
     from_below_c: int = 0,
     from_above_c: int = 0,
     lookback_ticks: int = 10,
+    multi_trade: bool = False,
 ) -> pd.DataFrame:
     """Sweep step_c 1→max_step_c, aggregate across all entry tiers."""
     rows = []
@@ -210,17 +335,18 @@ def run_ladder_sweep(
             from_below_c=from_below_c,
             from_above_c=from_above_c,
             lookback_ticks=lookback_ticks,
+            multi_trade=multi_trade,
         )
         if result.empty:
             continue
-        total = int(result["markets"].sum())
+        total = int(result["trades"].sum())
         if total == 0:
             continue
         hit     = int(result["hit_ticks"].sum())
         stopped = int(result["stopped"].sum())
         s_yes   = int(result["settled_yes"].sum())
         s_no    = int(result["settled_no"].sum())
-        exp_pnl_c = float((result["exp_pnl_c"] * result["markets"]).sum()) / total
+        exp_pnl_c = float((result["exp_pnl_c"] * result["trades"]).sum()) / total
         rows.append({
             "step_c":    step_c,
             "markets":   total,
@@ -237,7 +363,7 @@ def run_ladder_sweep(
 
 # ── Printing ───────────────────────────────────────────────────────────────
 
-def _header_str(stop_loss_c, from_below_c, from_above_c):
+def _header_str(stop_loss_c, from_below_c, from_above_c, multi_trade=False):
     parts = []
     if stop_loss_c:
         parts.append(f"stop −{stop_loss_c}c")
@@ -247,6 +373,8 @@ def _header_str(stop_loss_c, from_below_c, from_above_c):
         parts.append(f"from-below {from_below_c}c (YES↑ only)")
     elif from_above_c:
         parts.append(f"from-above {from_above_c}c (NO↓ only)")
+    if multi_trade:
+        parts.append("multi-trade")
     return ("  " + ", ".join(parts)) if parts else ""
 
 
@@ -257,21 +385,24 @@ def print_ladder_results(
     stop_loss_c: int = 0,
     from_below_c: int = 0,
     from_above_c: int = 0,
+    multi_trade: bool = False,
 ) -> None:
     if results.empty:
         print("  No data.")
         return
 
-    hdr = _header_str(stop_loss_c, from_below_c, from_above_c)
+    hdr       = _header_str(stop_loss_c, from_below_c, from_above_c, multi_trade)
     both_sides = from_below_c > 0 and from_above_c > 0
     has_stop   = stop_loss_c > 0
 
-    print(f"\n{'='*88}")
+    print(f"\n{'='*92}")
     print(f"  LADDER BACKTEST — {asset}{hdr}")
     print(f"  hit = reached target  |  stop = reversed {stop_loss_c}c against entry" if has_stop
           else f"  hit = reached target in observed ticks")
     print(f"  settled_yes/no = held to resolution  |  exp_pnl_c = expected cents/trade")
-    print(f"{'='*88}")
+    if multi_trade:
+        print(f"  trades = all round-trips per market  |  /mkt = avg trades per 15-min window")
+    print(f"{'='*92}")
 
     if both_sides:
         print(
@@ -294,22 +425,33 @@ def print_ladder_results(
                 f"{row['exp_pnl_c']:>+8.1f}c{flag}"
             )
     else:
-        print(
-            f"  {'entry':>6}  {'target':>6}  {'mkts':>5}  "
-            f"{'hit_tks':>7}  {'hit%':>5}  "
+        avg_col = multi_trade
+        hdr_line = (
+            f"  {'entry':>6}  {'target':>6}  {'trades':>6}"
+            + (f"  {'/mkt':>4}" if avg_col else "")
+            + f"  {'hit_tks':>7}  {'hit%':>5}  "
             + (f"{'stopd':>5}  {'stp%':>5}  " if has_stop else "")
             + f"{'s_yes':>5}  {'s_no':>5}  {'exp_pnl_c':>9}"
         )
-        sep = f"  {'─'*6}  {'─'*6}  {'─'*5}  {'─'*7}  {'─'*5}  "
-        sep += (f"{'─'*5}  {'─'*5}  " if has_stop else "")
-        sep += f"{'─'*5}  {'─'*5}  {'─'*9}"
-        print(sep)
+        sep_line = (
+            f"  {'─'*6}  {'─'*6}  {'─'*6}"
+            + (f"  {'─'*4}" if avg_col else "")
+            + f"  {'─'*7}  {'─'*5}  "
+            + (f"{'─'*5}  {'─'*5}  " if has_stop else "")
+            + f"{'─'*5}  {'─'*5}  {'─'*9}"
+        )
+        print(hdr_line)
+        print(sep_line)
         for _, row in results.iterrows():
             flag = " ◀" if row["exp_pnl_c"] > 0 else ""
             line = (
                 f"  {int(row['entry_c']):>5}c  {int(row['target_c']):>5}c  "
-                f"{int(row['markets']):>5}  "
-                f"{int(row['hit_ticks']):>7}  {row['hit_ticks%']:>4.1f}%  "
+                f"{int(row['trades']):>6}"
+            )
+            if avg_col and row["avg_t"] is not None:
+                line += f"  {row['avg_t']:>4.1f}"
+            line += (
+                f"  {int(row['hit_ticks']):>7}  {row['hit_ticks%']:>4.1f}%  "
             )
             if has_stop:
                 line += f"{int(row['stopped']):>5}  {row['stopped%']:>4.1f}%  "
@@ -327,13 +469,14 @@ def print_sweep_results(
     stop_loss_c: int = 20,
     from_below_c: int = 0,
     from_above_c: int = 0,
+    multi_trade: bool = False,
 ) -> None:
     if results.empty:
         print("  No data.")
         return
 
     max_step  = int(results["step_c"].max())
-    hdr = _header_str(stop_loss_c, from_below_c, from_above_c)
+    hdr = _header_str(stop_loss_c, from_below_c, from_above_c, multi_trade)
     both_sides = from_below_c > 0 and from_above_c > 0
 
     print(f"\n{'='*82}")

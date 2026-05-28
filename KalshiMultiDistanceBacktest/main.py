@@ -13,6 +13,7 @@ Usage:
   python main.py ladder --asset ETH --sweep --stop 20   # sweep steps 1-30, stop=20c
   python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10  # momentum entry
   python main.py ladder --asset ETH --sweep --stop 10 --from-below 10    # sweep w/ momentum
+  python main.py ladder --asset BTC --step 5 --stop 5 --multi            # all round-trips
   python main.py backtest --asset XRP
 """
 
@@ -113,6 +114,7 @@ def cmd_ladder(
     sweep: bool = False,
     from_below_c: int = 0,
     from_above_c: int = 0,
+    multi_trade: bool = False,
 ):
     import pandas as pd
     from pathlib import Path
@@ -137,14 +139,18 @@ def cmd_ladder(
             results = run_ladder_sweep(
                 df, max_step_c=step_c, stop_loss_c=stop_loss_c,
                 from_below_c=from_below_c, from_above_c=from_above_c,
+                multi_trade=multi_trade,
             )
-            print_sweep_results(results, name, stop_loss_c, from_below_c, from_above_c)
+            print_sweep_results(results, name, stop_loss_c, from_below_c, from_above_c,
+                                multi_trade=multi_trade)
         else:
             results = run_ladder_backtest(
                 df, step_c=step_c, stop_loss_c=stop_loss_c,
                 from_below_c=from_below_c, from_above_c=from_above_c,
+                multi_trade=multi_trade,
             )
-            print_ladder_results(results, name, step_c, stop_loss_c, from_below_c, from_above_c)
+            print_ladder_results(results, name, step_c, stop_loss_c, from_below_c, from_above_c,
+                                 multi_trade=multi_trade)
 
 
 def main():
@@ -204,6 +210,9 @@ def main():
             from_above_c = int(args[i + 1])
             break
 
+    # Parse --multi
+    multi_trade = "--multi" in args
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
@@ -214,6 +223,7 @@ def main():
         cmd_ladder(
             asset, step_c=step_c, stop_loss_c=stop_loss_c,
             sweep=sweep, from_below_c=from_below_c, from_above_c=from_above_c,
+            multi_trade=multi_trade,
         )
     else:
         print(__doc__)
