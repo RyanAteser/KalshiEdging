@@ -10,6 +10,7 @@ Usage:
   python main.py fetch --asset ETH  # single asset
   python main.py build --asset SOL
   python main.py ladder --asset BTC --step 5   # 5-cent increments
+  python main.py ladder --asset ETH --sweep --stop 20   # sweep steps 1-30, stop=20c
   python main.py backtest --asset XRP
 """
 
@@ -103,10 +104,13 @@ def cmd_backtest(asset_filter=None):
         print()
 
 
-def cmd_ladder(asset_filter=None, step_c: int = 10):
+def cmd_ladder(asset_filter=None, step_c: int = 10, stop_loss_c: int = 0, sweep: bool = False):
     import pandas as pd
     from pathlib import Path
-    from backtest.ladder_backtest import run_ladder_backtest, print_ladder_results
+    from backtest.ladder_backtest import (
+        run_ladder_backtest, run_ladder_sweep,
+        print_ladder_results, print_sweep_results,
+    )
 
     assets = [asset_filter] if asset_filter else ENABLED_ASSETS
     for name in assets:
@@ -120,8 +124,12 @@ def cmd_ladder(asset_filter=None, step_c: int = 10):
         df = pd.read_parquet(ds_path)
         print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
               f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
-        results = run_ladder_backtest(df, step_c=step_c)
-        print_ladder_results(results, name, step_c)
+        if sweep:
+            results = run_ladder_sweep(df, max_step_c=step_c, stop_loss_c=stop_loss_c)
+            print_sweep_results(results, name, stop_loss_c)
+        else:
+            results = run_ladder_backtest(df, step_c=step_c, stop_loss_c=stop_loss_c)
+            print_ladder_results(results, name, step_c, stop_loss_c)
 
 
 def main():
@@ -138,14 +146,27 @@ def main():
             asset = args[i + 1].upper()
             break
 
-    # Parse --step 5  or  --step=5
-    step_c = 10
+    # Parse --sweep
+    sweep = "--sweep" in args
+
+    # Parse --step 5  or  --step=5  (when --sweep, means max_step_c; default 30)
+    step_c = 30 if sweep else 10
     for i, a in enumerate(args):
         if a.startswith("--step="):
             step_c = int(a.split("=", 1)[1])
             break
         if a == "--step" and i + 1 < len(args):
             step_c = int(args[i + 1])
+            break
+
+    # Parse --stop N  or  --stop=N
+    stop_loss_c = 0
+    for i, a in enumerate(args):
+        if a.startswith("--stop="):
+            stop_loss_c = int(a.split("=", 1)[1])
+            break
+        if a == "--stop" and i + 1 < len(args):
+            stop_loss_c = int(args[i + 1])
             break
 
     if cmd == "fetch":
@@ -155,7 +176,7 @@ def main():
     elif cmd == "backtest":
         cmd_backtest(asset)
     elif cmd == "ladder":
-        cmd_ladder(asset, step_c=step_c)
+        cmd_ladder(asset, step_c=step_c, stop_loss_c=stop_loss_c, sweep=sweep)
     else:
         print(__doc__)
 
