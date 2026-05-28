@@ -7,15 +7,14 @@ Saves results to parquet keyed by asset config.
 
 from __future__ import annotations
 
-import json
+import os
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+import requests
 
 _COINBASE_BASE   = "https://api.exchange.coinbase.com/products/{pair}/candles"
 _KRAKEN_URL      = "https://api.kraken.com/0/public/OHLC"
@@ -24,20 +23,19 @@ _BINANCE_HOSTS   = [
     "https://api.binance.us/api/v3/klines",
 ]
 
-import os
 _BINANCE_OVERRIDE = os.getenv("BINANCE_BASE_URL", "")
 
+_HEADERS = {
+    "User-Agent": "kalshi-multibacktest/1.0",
+    "Accept":     "application/json",
+}
 
-def _request_json(url: str, timeout: int = 15):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "kalshi-multibacktest/1.0",
-            "Accept":     "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+
+def _request_json(url: str, connect_timeout: float = 6.0, read_timeout: float = 15.0):
+    """GET url and return parsed JSON.  Raises on HTTP errors or timeouts."""
+    resp = requests.get(url, headers=_HEADERS, timeout=(connect_timeout, read_timeout))
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _probe_binance(symbol: str) -> Optional[str]:
@@ -159,15 +157,15 @@ def _fetch_coinbase(start_ms: int, end_ms: int, coinbase_pair: str = "BTC-USD") 
 
         try:
             candles = _request_json(url)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
                 print(f"    Coinbase 404 — pair {coinbase_pair!r} not listed")
-                return []
-            print(f"    Coinbase HTTP {exc.code}: {exc}")
-            break
+            else:
+                print(f"    Coinbase HTTP error: {exc}")
+            return []
         except Exception as exc:
-            print(f"    Coinbase batch failed: {exc}")
-            break
+            print(f"    Coinbase failed: {exc}")
+            return []
 
         if not isinstance(candles, list) or not candles:
             break
