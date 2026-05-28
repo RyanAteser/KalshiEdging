@@ -51,8 +51,8 @@ ASSETS = {
         "kraken_pair":    "XRPUSD",
         "annual_vol":     0.90,
         "min_strike":     0.05,
-        "thresholds":     [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.15],
-        "stop_dist":      0.005,
+        "thresholds":     [0.001, 0.002, 0.003, 0.005, 0.007, 0.010, 0.013],
+        "stop_dist":      0.0003,
         "price_file":     "prices_xrp_1m.parquet",
     },
     "DOGE": {
