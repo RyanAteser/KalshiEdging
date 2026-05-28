@@ -80,7 +80,8 @@ def cmd_backtest(asset_filter=None):
         print_results(results)
 
         if not results.empty and results["trades"].sum() > 0:
-            best = results.loc[results["avg_pnl"].idxmax()]
+            from backtest.distance_backtest import _best_row
+            best = results.loc[_best_row(results)]
             summary_rows.append({
                 "asset":      name,
                 "best_dist":  best["entry_dist"],
