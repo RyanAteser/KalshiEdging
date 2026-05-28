@@ -6,8 +6,10 @@ Usage:
   python main.py fetch              # fetch prices + Kalshi ticks for all assets
   python main.py build              # build per-asset datasets
   python main.py backtest           # run distance backtest for all assets
+  python main.py ladder             # price-ladder bounce analysis (all assets)
   python main.py fetch --asset ETH  # single asset
   python main.py build --asset SOL
+  python main.py ladder --asset BTC --step 5   # 5-cent increments
   python main.py backtest --asset XRP
 """
 
@@ -101,6 +103,27 @@ def cmd_backtest(asset_filter=None):
         print()
 
 
+def cmd_ladder(asset_filter=None, step_c: int = 10):
+    import pandas as pd
+    from pathlib import Path
+    from backtest.ladder_backtest import run_ladder_backtest, print_ladder_results
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            continue
+        df = pd.read_parquet(ds_path)
+        print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+              f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
+        results = run_ladder_backtest(df, step_c=step_c)
+        print_ladder_results(results, name, step_c)
+
+
 def main():
     args  = sys.argv[1:]
     cmd   = args[0] if args else "backtest"
@@ -115,12 +138,24 @@ def main():
             asset = args[i + 1].upper()
             break
 
+    # Parse --step 5  or  --step=5
+    step_c = 10
+    for i, a in enumerate(args):
+        if a.startswith("--step="):
+            step_c = int(a.split("=", 1)[1])
+            break
+        if a == "--step" and i + 1 < len(args):
+            step_c = int(args[i + 1])
+            break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
         cmd_build(asset)
     elif cmd == "backtest":
         cmd_backtest(asset)
+    elif cmd == "ladder":
+        cmd_ladder(asset, step_c=step_c)
     else:
         print(__doc__)
 
