@@ -95,4 +95,4 @@ _env_assets = os.getenv("ASSETS", "")
 ENABLED_ASSETS = [a.strip().upper() for a in _env_assets.split(",") if a.strip()] \
                  or list(ASSETS.keys())
 
-DAYS = 30
+DAYS = 90
