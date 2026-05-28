@@ -7,19 +7,22 @@ then measures whether it reached the next tier (hit_ticks), stopped out
 
 Entry logic: ask within ±tolerance_c of entry level (default ±2c).
 
+Momentum filter (from_below_c > 0):
+  Only enter if the ask was ≤ (entry − from_below_c) within the prior
+  lookback_ticks ticks — i.e., the price rose *through* the entry tier.
+  Skips entries where the price is falling through the tier.
+
 Four outcomes per trade:
   hit_ticks   — ask reached target tier  → pnl = +step_c
   stopped     — ask fell stop_loss_c below entry → pnl = -stop_loss_c
   settled_yes — resolved YES before either level → pnl = 100 - entry_c
   settled_no  — resolved NO  before either level → pnl = -entry_c
 
-Sweep mode runs step_c from 1 to max_step_c and aggregates across all tiers.
-
 Usage (via main.py):
-  python main.py ladder --asset ETH                        # default step=10, no stop
-  python main.py ladder --asset ETH --step 5 --stop 20    # single step, stop=20c
-  python main.py ladder --asset ETH --sweep --stop 20     # sweep steps 1-30, stop=20c
-  python main.py ladder --asset BTC --sweep --stop 20 --step 40  # sweep 1-40
+  python main.py ladder --asset ETH
+  python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10
+  python main.py ladder --asset ETH --sweep --stop 20
+  python main.py ladder --asset ETH --sweep --stop 10 --from-below 10
 """
 
 from __future__ import annotations
@@ -32,16 +35,20 @@ def run_ladder_backtest(
     step_c: int = 10,
     tolerance_c: int = 2,
     stop_loss_c: int = 0,
+    from_below_c: int = 0,
+    lookback_ticks: int = 10,
 ) -> pd.DataFrame:
     """
     For each entry tier (step_c to 99c at step_c intervals):
       1. Find first tick per market where ask is within ±tolerance_c of entry
+         (and, if from_below_c>0, ask rose from ≤ entry-from_below_c in prior ticks)
       2. Scan subsequent ticks for first of: hit target, hit stop, or settle
     """
-    step      = step_c / 100.0
-    tolerance = tolerance_c / 100.0
-    stop_loss = stop_loss_c / 100.0
-    results   = []
+    step       = step_c / 100.0
+    tolerance  = tolerance_c / 100.0
+    stop_loss  = stop_loss_c / 100.0
+    from_below = from_below_c / 100.0
+    results    = []
 
     for entry_c in range(step_c, 100, step_c):
         entry  = entry_c / 100.0
@@ -49,7 +56,8 @@ def run_ladder_backtest(
         if target > 1.001:
             break
 
-        stop_level = (entry - stop_loss) if stop_loss > 0 else -1.0
+        stop_level   = (entry - stop_loss) if stop_loss > 0 else -1.0
+        below_level  = (entry - from_below) if from_below > 0 else None
 
         n_entered     = 0
         n_hit_ticks   = 0
@@ -65,11 +73,19 @@ def run_ladder_backtest(
                 continue
 
             entry_idx = int(eligible.index[0])
+
+            # Momentum filter: require ask came from below entry tier
+            if below_level is not None:
+                start = max(0, entry_idx - lookback_ticks)
+                prior_asks = mkt["ask"].iloc[start:entry_idx].values
+                if not (prior_asks <= below_level).any():
+                    continue  # arrived from above — skip
+
             outcome   = int(mkt["outcome"].iloc[-1])
             n_entered += 1
 
             after    = mkt.iloc[entry_idx + 1:]
-            ask_vals = after["ask"].values  # numpy; NaN comparisons → False (safe)
+            ask_vals = after["ask"].values  # numpy; NaN → False in comparisons
 
             hits_target = ask_vals >= target
 
@@ -126,6 +142,8 @@ def run_ladder_sweep(
     max_step_c: int = 30,
     tolerance_c: int = 2,
     stop_loss_c: int = 20,
+    from_below_c: int = 0,
+    lookback_ticks: int = 10,
 ) -> pd.DataFrame:
     """
     Sweep step_c from 1 to max_step_c.
@@ -134,7 +152,12 @@ def run_ladder_sweep(
     rows = []
     for step_c in range(1, max_step_c + 1):
         result = run_ladder_backtest(
-            df, step_c=step_c, tolerance_c=tolerance_c, stop_loss_c=stop_loss_c
+            df,
+            step_c=step_c,
+            tolerance_c=tolerance_c,
+            stop_loss_c=stop_loss_c,
+            from_below_c=from_below_c,
+            lookback_ticks=lookback_ticks,
         )
         if result.empty:
             continue
@@ -170,16 +193,18 @@ def print_ladder_results(
     asset: str = "",
     step_c: int = 10,
     stop_loss_c: int = 0,
+    from_below_c: int = 0,
 ) -> None:
     if results.empty:
         print("  No data.")
         return
 
-    stop_str = f", stop −{stop_loss_c}c" if stop_loss_c else ""
-    has_stop = stop_loss_c > 0
+    stop_str  = f", stop −{stop_loss_c}c" if stop_loss_c else ""
+    below_str = f", from-below {from_below_c}c" if from_below_c else ""
+    has_stop  = stop_loss_c > 0
 
     print(f"\n{'='*82}")
-    print(f"  LADDER BACKTEST — {asset}   (buy at entry_c, sell at target_c{stop_str})")
+    print(f"  LADDER BACKTEST — {asset}   (buy at entry_c, sell at target_c{stop_str}{below_str})")
     if has_stop:
         print(f"  hit_ticks = reached target  |  stopped = fell {stop_loss_c}c below entry")
     else:
@@ -229,14 +254,16 @@ def print_sweep_results(
     results: pd.DataFrame,
     asset: str = "",
     stop_loss_c: int = 20,
+    from_below_c: int = 0,
 ) -> None:
     if results.empty:
         print("  No data.")
         return
 
-    max_step = int(results["step_c"].max())
+    max_step  = int(results["step_c"].max())
+    below_str = f"  from-below={from_below_c}c" if from_below_c else ""
     print(f"\n{'='*78}")
-    print(f"  LADDER SWEEP — {asset}   stop=−{stop_loss_c}c  tolerance=±2c  steps 1→{max_step}")
+    print(f"  LADDER SWEEP — {asset}   stop=−{stop_loss_c}c  tolerance=±2c  steps 1→{max_step}{below_str}")
     print(f"  exp_pnl_c = weighted avg across all entry tiers for that step size")
     print(f"  BE_hit% = breakeven hit rate = stop / (step + stop)")
     print(f"{'='*78}")

@@ -11,6 +11,8 @@ Usage:
   python main.py build --asset SOL
   python main.py ladder --asset BTC --step 5   # 5-cent increments
   python main.py ladder --asset ETH --sweep --stop 20   # sweep steps 1-30, stop=20c
+  python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10  # momentum entry
+  python main.py ladder --asset ETH --sweep --stop 10 --from-below 10    # sweep w/ momentum
   python main.py backtest --asset XRP
 """
 
@@ -104,7 +106,13 @@ def cmd_backtest(asset_filter=None):
         print()
 
 
-def cmd_ladder(asset_filter=None, step_c: int = 10, stop_loss_c: int = 0, sweep: bool = False):
+def cmd_ladder(
+    asset_filter=None,
+    step_c: int = 10,
+    stop_loss_c: int = 0,
+    sweep: bool = False,
+    from_below_c: int = 0,
+):
     import pandas as pd
     from pathlib import Path
     from backtest.ladder_backtest import (
@@ -125,11 +133,15 @@ def cmd_ladder(asset_filter=None, step_c: int = 10, stop_loss_c: int = 0, sweep:
         print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
               f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
         if sweep:
-            results = run_ladder_sweep(df, max_step_c=step_c, stop_loss_c=stop_loss_c)
-            print_sweep_results(results, name, stop_loss_c)
+            results = run_ladder_sweep(
+                df, max_step_c=step_c, stop_loss_c=stop_loss_c, from_below_c=from_below_c
+            )
+            print_sweep_results(results, name, stop_loss_c, from_below_c)
         else:
-            results = run_ladder_backtest(df, step_c=step_c, stop_loss_c=stop_loss_c)
-            print_ladder_results(results, name, step_c, stop_loss_c)
+            results = run_ladder_backtest(
+                df, step_c=step_c, stop_loss_c=stop_loss_c, from_below_c=from_below_c
+            )
+            print_ladder_results(results, name, step_c, stop_loss_c, from_below_c)
 
 
 def main():
@@ -169,6 +181,16 @@ def main():
             stop_loss_c = int(args[i + 1])
             break
 
+    # Parse --from-below N  or  --from-below=N
+    from_below_c = 0
+    for i, a in enumerate(args):
+        if a.startswith("--from-below="):
+            from_below_c = int(a.split("=", 1)[1])
+            break
+        if a == "--from-below" and i + 1 < len(args):
+            from_below_c = int(args[i + 1])
+            break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
@@ -176,7 +198,7 @@ def main():
     elif cmd == "backtest":
         cmd_backtest(asset)
     elif cmd == "ladder":
-        cmd_ladder(asset, step_c=step_c, stop_loss_c=stop_loss_c, sweep=sweep)
+        cmd_ladder(asset, step_c=step_c, stop_loss_c=stop_loss_c, sweep=sweep, from_below_c=from_below_c)
     else:
         print(__doc__)
 
