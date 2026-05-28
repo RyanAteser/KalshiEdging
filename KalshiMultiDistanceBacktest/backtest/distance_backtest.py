@@ -169,10 +169,22 @@ def run_distance_backtest(
 
 # ── Printing ───────────────────────────────────────────────────────────────
 
+def _best_row(results: pd.DataFrame) -> int:
+    """Return index of best threshold: highest avg_pnl among rows with >=10 trades.
+    Falls back to >=5, then any trade, to avoid picking 1-trade outliers."""
+    for min_t in (10, 5, 1):
+        q = results[results["trades"] >= min_t]
+        if not q.empty:
+            return q["avg_pnl"].idxmax()
+    return results.index[0]
+
+
 def print_results(results: pd.DataFrame) -> None:
     if results.empty or results["trades"].sum() == 0:
         print("  No trades generated.")
         return
+
+    best_idx = _best_row(results)
 
     print(
         f"  {'entry_dist':>10}  {'trades':>6}  {'win_rate':>8}  "
@@ -180,8 +192,8 @@ def print_results(results: pd.DataFrame) -> None:
     )
     print(f"  {'-'*10}  {'-'*6}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*10}")
 
-    for _, row in results.iterrows():
-        marker = " ←best" if row["avg_pnl"] == results["avg_pnl"].max() else ""
+    for idx, row in results.iterrows():
+        marker = " ←best" if idx == best_idx else ""
         print(
             f"  {row['entry_dist']:>10.4g}  {int(row['trades']):>6}  "
             f"{row['win_rate']:>7.1f}%  {row['stop_rate']:>8.1f}%  "
