@@ -7,6 +7,7 @@ Usage:
   python main.py build              # build per-asset datasets
   python main.py backtest           # run distance backtest for all assets
   python main.py ladder             # price-ladder bounce analysis (all assets)
+  python main.py scalp              # fixed-spread scalp backtest (multi-entry per market)
   python main.py fetch --asset ETH  # single asset
   python main.py build --asset SOL
   python main.py ladder --asset BTC --step 5   # 5-cent increments
@@ -14,6 +15,13 @@ Usage:
   python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10  # momentum entry
   python main.py ladder --asset ETH --sweep --stop 10 --from-below 10    # sweep w/ momentum
   python main.py backtest --asset XRP
+
+  # Scalp examples (buy at X, sell at X+spread, re-enter after each exit)
+  python main.py scalp --asset BTC --buy 60 --spread 5          # single config
+  python main.py scalp --asset BTC --buy 60 --spread 5 --stop 10
+  python main.py scalp --asset BTC --spread 5 --sweep-buy        # sweep all buy prices
+  python main.py scalp --asset ETH --buy 60 --sweep-spread       # sweep all spreads
+  python main.py scalp --asset BTC --spread 5 --sweep-buy --stop 10
 """
 
 import sys
@@ -147,6 +155,47 @@ def cmd_ladder(
             print_ladder_results(results, name, step_c, stop_loss_c, from_below_c, from_above_c)
 
 
+def cmd_scalp(
+    asset_filter=None,
+    buy_c: int = 60,
+    spread_c: int = 5,
+    stop_c: int = 0,
+    sweep_buy: bool = False,
+    sweep_spread: bool = False,
+    tol_c: int = 2,
+):
+    import pandas as pd
+    from pathlib import Path
+    from backtest.scalp_backtest import (
+        run_scalp_backtest, run_sweep_buy, run_sweep_spread,
+        print_scalp_single, print_sweep_buy, print_sweep_spread,
+    )
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            continue
+        df = pd.read_parquet(ds_path)
+        print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+              f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
+
+        if sweep_buy:
+            results = run_sweep_buy(df, spread_c=spread_c, stop_c=stop_c, tol_c=tol_c)
+            print_sweep_buy(results, name, spread_c, stop_c)
+        elif sweep_spread:
+            results = run_sweep_spread(df, buy_c=buy_c, stop_c=stop_c, tol_c=tol_c)
+            print_sweep_spread(results, name, buy_c, stop_c)
+        else:
+            sell_c = buy_c + spread_c
+            r = run_scalp_backtest(df, buy_c=buy_c, sell_c=sell_c, stop_c=stop_c, tol_c=tol_c)
+            print_scalp_single(r)
+
+
 def main():
     args  = sys.argv[1:]
     cmd   = args[0] if args else "backtest"
@@ -204,6 +253,33 @@ def main():
             from_above_c = int(args[i + 1])
             break
 
+    # Parse --buy N
+    buy_c = 60
+    for i, a in enumerate(args):
+        if a.startswith("--buy="):
+            buy_c = int(a.split("=", 1)[1]); break
+        if a == "--buy" and i + 1 < len(args):
+            buy_c = int(args[i + 1]); break
+
+    # Parse --spread N
+    spread_c = 5
+    for i, a in enumerate(args):
+        if a.startswith("--spread="):
+            spread_c = int(a.split("=", 1)[1]); break
+        if a == "--spread" and i + 1 < len(args):
+            spread_c = int(args[i + 1]); break
+
+    # Parse --tol N  (entry tolerance in cents, default 2)
+    tol_c = 2
+    for i, a in enumerate(args):
+        if a.startswith("--tol="):
+            tol_c = int(a.split("=", 1)[1]); break
+        if a == "--tol" and i + 1 < len(args):
+            tol_c = int(args[i + 1]); break
+
+    sweep_buy    = "--sweep-buy"    in args
+    sweep_spread = "--sweep-spread" in args
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
@@ -214,6 +290,11 @@ def main():
         cmd_ladder(
             asset, step_c=step_c, stop_loss_c=stop_loss_c,
             sweep=sweep, from_below_c=from_below_c, from_above_c=from_above_c,
+        )
+    elif cmd == "scalp":
+        cmd_scalp(
+            asset, buy_c=buy_c, spread_c=spread_c, stop_c=stop_loss_c,
+            sweep_buy=sweep_buy, sweep_spread=sweep_spread, tol_c=tol_c,
         )
     else:
         print(__doc__)
