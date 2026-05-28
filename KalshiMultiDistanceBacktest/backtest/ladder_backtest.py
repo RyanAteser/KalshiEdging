@@ -56,7 +56,7 @@ def _resolve_trade(
         else:
             if hits_target.any():
                 return "hit"
-        return "settled_no" if outcome == 1 else "settled_yes"  # reversed: YES settles YES = NO loses
+        return "settled_yes" if outcome == 1 else "settled_no"  # consistent: settled_yes = market resolved YES
 
 
 def run_ladder_backtest(
