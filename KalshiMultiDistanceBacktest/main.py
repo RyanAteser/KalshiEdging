@@ -112,6 +112,7 @@ def cmd_ladder(
     stop_loss_c: int = 0,
     sweep: bool = False,
     from_below_c: int = 0,
+    from_above_c: int = 0,
 ):
     import pandas as pd
     from pathlib import Path
@@ -134,14 +135,16 @@ def cmd_ladder(
               f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
         if sweep:
             results = run_ladder_sweep(
-                df, max_step_c=step_c, stop_loss_c=stop_loss_c, from_below_c=from_below_c
+                df, max_step_c=step_c, stop_loss_c=stop_loss_c,
+                from_below_c=from_below_c, from_above_c=from_above_c,
             )
-            print_sweep_results(results, name, stop_loss_c, from_below_c)
+            print_sweep_results(results, name, stop_loss_c, from_below_c, from_above_c)
         else:
             results = run_ladder_backtest(
-                df, step_c=step_c, stop_loss_c=stop_loss_c, from_below_c=from_below_c
+                df, step_c=step_c, stop_loss_c=stop_loss_c,
+                from_below_c=from_below_c, from_above_c=from_above_c,
             )
-            print_ladder_results(results, name, step_c, stop_loss_c, from_below_c)
+            print_ladder_results(results, name, step_c, stop_loss_c, from_below_c, from_above_c)
 
 
 def main():
@@ -191,6 +194,16 @@ def main():
             from_below_c = int(args[i + 1])
             break
 
+    # Parse --from-above N  or  --from-above=N
+    from_above_c = 0
+    for i, a in enumerate(args):
+        if a.startswith("--from-above="):
+            from_above_c = int(a.split("=", 1)[1])
+            break
+        if a == "--from-above" and i + 1 < len(args):
+            from_above_c = int(args[i + 1])
+            break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
@@ -198,7 +211,10 @@ def main():
     elif cmd == "backtest":
         cmd_backtest(asset)
     elif cmd == "ladder":
-        cmd_ladder(asset, step_c=step_c, stop_loss_c=stop_loss_c, sweep=sweep, from_below_c=from_below_c)
+        cmd_ladder(
+            asset, step_c=step_c, stop_loss_c=stop_loss_c,
+            sweep=sweep, from_below_c=from_below_c, from_above_c=from_above_c,
+        )
     else:
         print(__doc__)
 
