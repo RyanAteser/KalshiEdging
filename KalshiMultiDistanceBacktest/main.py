@@ -3,25 +3,25 @@
 Multi-asset exact distance backtest for Kalshi 15-minute markets.
 
 Usage:
-  python main.py fetch              # fetch prices + Kalshi ticks for all assets
-  python main.py build              # build per-asset datasets
-  python main.py backtest           # run distance backtest for all assets
-  python main.py ladder             # price-ladder bounce analysis (all assets)
-  python main.py scalp              # fixed-spread scalp backtest (multi-entry per market)
-  python main.py fetch --asset ETH  # single asset
-  python main.py build --asset SOL
-  python main.py ladder --asset BTC --step 5   # 5-cent increments
-  python main.py ladder --asset ETH --sweep --stop 20   # sweep steps 1-30, stop=20c
-  python main.py ladder --asset ETH --step 10 --stop 10 --from-below 10  # momentum entry
-  python main.py ladder --asset ETH --sweep --stop 10 --from-below 10    # sweep w/ momentum
-  python main.py backtest --asset XRP
+  %PY% main.py fetch              # fetch prices + Kalshi ticks for all assets
+  %PY% main.py build              # build per-asset datasets
+  %PY% main.py backtest           # run distance backtest for all assets
+  %PY% main.py ladder             # price-ladder bounce analysis (all assets)
+  %PY% main.py scalp              # fixed-spread scalp backtest (multi-entry per market)
+  %PY% main.py fetch --asset ETH  # single asset
+  %PY% main.py build --asset SOL
+  %PY% main.py ladder --asset BTC --step 5   # 5-cent increments
+  %PY% main.py ladder --asset ETH --sweep --stop 20   # sweep steps 1-30, stop=20c
+  %PY% main.py ladder --asset ETH --step 10 --stop 10 --from-below 10  # momentum entry
+  %PY% main.py ladder --asset ETH --sweep --stop 10 --from-below 10    # sweep w/ momentum
+  %PY% main.py backtest --asset XRP
 
   # Scalp examples (buy at X, sell at X+spread, re-enter after each exit)
-  python main.py scalp --asset BTC --buy 60 --spread 5          # single config
-  python main.py scalp --asset BTC --buy 60 --spread 5 --stop 10
-  python main.py scalp --asset BTC --spread 5 --sweep-buy        # sweep all buy prices
-  python main.py scalp --asset ETH --buy 60 --sweep-spread       # sweep all spreads
-  python main.py scalp --asset BTC --spread 5 --sweep-buy --stop 10
+  %PY% main.py scalp --asset BTC --buy 60 --spread 5          # single config
+  %PY% main.py scalp --asset BTC --buy 60 --spread 5 --stop 10
+  %PY% main.py scalp --asset BTC --spread 5 --sweep-buy        # sweep all buy prices
+  %PY% main.py scalp --asset ETH --buy 60 --sweep-spread       # sweep all spreads
+  %PY% main.py scalp --asset BTC --spread 5 --sweep-buy --stop 10
 """
 
 import sys
