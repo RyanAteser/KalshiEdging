@@ -249,6 +249,8 @@ def cmd_settle(
     asset_filter=None,
     side: str = "yes",
     z_values: list | None = None,
+    t_min: float = 60,
+    t_max: float = 900,
 ):
     import pandas as pd
     from pathlib import Path
@@ -269,7 +271,8 @@ def cmd_settle(
         print(f"\n{name} — {len(df):,} ticks, {df['ticker'].nunique()} markets  "
               + (f"[1m candles: {len(btc_1m):,}]" if btc_1m is not None else "[no 1m data]"))
 
-        results = run_settle_sweep(df, btc_1m=btc_1m, side=side, z_values=z_values)
+        results = run_settle_sweep(df, btc_1m=btc_1m, side=side, z_values=z_values,
+                                   t_min=t_min, t_max=t_max)
         print_settle_sweep(results, name, side)
 
 
@@ -493,6 +496,20 @@ def main():
                            [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]
                            if z_lo <= round(z,1) <= z_hi]
 
+    # Parse --t-min / --t-max (for settle command entry window)
+    t_min_val = 60.0
+    t_max_val = 900.0
+    for i, a in enumerate(args):
+        if a.startswith("--t-min="):
+            t_min_val = float(a.split("=", 1)[1]); break
+        if a == "--t-min" and i + 1 < len(args):
+            t_min_val = float(args[i + 1]); break
+    for i, a in enumerate(args):
+        if a.startswith("--t-max="):
+            t_max_val = float(a.split("=", 1)[1]); break
+        if a == "--t-max" and i + 1 < len(args):
+            t_max_val = float(args[i + 1]); break
+
     # Parse --data-dir
     data_dir = ""
     for i, a in enumerate(args):
@@ -511,7 +528,7 @@ def main():
         cmd_backtest(asset)
     elif cmd == "settle":
         cmd_settle(asset, side=side_arg if side_arg != "both" else "yes",
-                   z_values=settle_z_values)
+                   z_values=settle_z_values, t_min=t_min_val, t_max=t_max_val)
     elif cmd == "certainty":
         cmd_certainty(asset, side=side_arg)
     elif cmd == "zscore":
