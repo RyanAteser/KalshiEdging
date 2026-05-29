@@ -56,9 +56,9 @@ MIN_SECONDS_REMAINING    = 90.0
 COOLDOWN_TICKS_AFTER_EXIT = 3
 FEE_PER_CONTRACT_CENTS   = 7.0   # each side
 
-# How many prior BTC price ticks to accumulate before computing z-score.
-# Dataset tick interval is ~15-30s, so 20 ticks ≈ 5-10 minutes of history.
-BTC_HISTORY_WINDOW = 40
+# Number of 1-minute BTC candles to use for z-score history.
+# 30 candles = 30 minutes of realized vol — enough to capture recent vol regime.
+BTC_HISTORY_WINDOW = 30
 
 
 # ── Per-market simulation ───────────────────────────────────────────────────
@@ -66,16 +66,19 @@ BTC_HISTORY_WINDOW = 40
 def _simulate_market(
     ticks: pd.DataFrame,
     z_threshold: float,
+    btc_1m: pd.DataFrame | None = None,   # 1m BTC candles (open_time, close)
 ) -> list[dict]:
     """
     Replay one market tick-by-tick.
+    Uses 1m BTC candle history for z-score if provided; falls back to tick prices.
     Returns list of trade records (one per closed position per zone).
     """
     outcome  = int(ticks["outcome"].iloc[-1])
     asks     = ticks["ask"].values * 100.0      # → cents
-    btc_hist = ticks["binance_price"].values
+    btc_tick = ticks["binance_price"].values
     t_lefts  = ticks["t_left"].values           # seconds remaining
     strikes  = ticks["strike"].values
+    times    = ticks["tick_time"].values        # numpy datetime64
 
     # Per-zone state
     zone_keys  = list(ZONES.keys())
@@ -90,12 +93,19 @@ def _simulate_market(
         ask      = asks[i]
         prev_ask = asks[i - 1]
         t_left   = float(t_lefts[i])
-        btc      = float(btc_hist[i])
+        btc      = float(btc_tick[i])
         strike   = float(strikes[i])
 
-        # Build BTC price history window (prices up to but not including tick i)
-        start  = max(0, i - BTC_HISTORY_WINDOW)
-        btc_window = list(btc_hist[start:i])
+        # Build BTC price history for z-score:
+        # Prefer 1m candle data (gives dense, evenly-spaced history).
+        # Fall back to Kalshi tick prices (sparse, but better than nothing).
+        if btc_1m is not None:
+            tick_ts  = pd.Timestamp(times[i])
+            mask     = btc_1m["open_time"] < tick_ts
+            recent   = btc_1m.loc[mask, "close"].values[-BTC_HISTORY_WINDOW:]
+            btc_window = list(recent) if len(recent) >= 5 else list(btc_tick[max(0, i-30):i])
+        else:
+            btc_window = list(btc_tick[max(0, i - BTC_HISTORY_WINDOW):i])
 
         # Compute z-score once per tick (shared across zones)
         z, sigma = compute_z_score(
@@ -213,23 +223,40 @@ def _reset_scratch() -> None:
 
 # ── Full backtest across all markets ───────────────────────────────────────
 
+def _load_btc_1m(asset_cfg: dict, data_dir: str = "data") -> pd.DataFrame | None:
+    """Load 1-minute BTC price candles if available."""
+    path = Path(data_dir) / asset_cfg.get("price_file", "")
+    if not path.exists():
+        return None
+    prices = pd.read_parquet(path)
+    prices["open_time"] = pd.to_datetime(prices["open_time"], utc=True)
+    return prices[["open_time", "close"]].sort_values("open_time").reset_index(drop=True)
+
+
 def run_zscore_backtest(
     df: pd.DataFrame,
     z_threshold: float = Z_MIN_THRESHOLD,
-    zone_filter: str | None = None,    # None = all zones
+    zone_filter: str | None = None,
+    btc_1m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Run z-gated zone backtest across all markets.
     Returns DataFrame of all trade records (including filtered ones).
+    btc_1m: 1-minute BTC price candles (open_time, close) for vol history.
     """
+    # Ensure tick_time is tz-aware to match btc_1m timestamps
+    if btc_1m is not None and "tick_time" in df.columns:
+        df = df.copy()
+        df["tick_time"] = pd.to_datetime(df["tick_time"], utc=True)
+
     all_records: list[dict] = []
 
     for _, mkt in df.groupby("ticker"):
         mkt = mkt.sort_values("tick_time").reset_index(drop=True)
-        if len(mkt) < 5:
+        if len(mkt) < 3:
             continue
         _reset_scratch()
-        records = _simulate_market(mkt, z_threshold=z_threshold)
+        records = _simulate_market(mkt, z_threshold=z_threshold, btc_1m=btc_1m)
         if zone_filter:
             records = [r for r in records if r["zone"] == zone_filter]
         all_records.extend(records)
@@ -241,27 +268,48 @@ def run_zscore_sweep(
     df: pd.DataFrame,
     z_values: list[float] | None = None,
     zone_filter: str | None = None,
+    btc_1m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Sweep z thresholds, showing how gate tightness affects hit rate and trade count.
+    Runs backtest once at z=0 to get all candidates, then re-filters by threshold
+    to avoid re-running the simulation N times.
     """
     if z_values is None:
-        z_values = [0.0, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+        z_values = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0]
+
+    # Single simulation pass at z=0 (get everything), then filter by z threshold
+    all_records = run_zscore_backtest(df, z_threshold=0.0,
+                                      zone_filter=zone_filter, btc_1m=btc_1m)
+    if all_records.empty:
+        return pd.DataFrame()
 
     rows = []
     for z_thresh in z_values:
-        records = run_zscore_backtest(df, z_threshold=z_thresh, zone_filter=zone_filter)
-        if records.empty:
-            continue
+        # Trades that would have been entered at this threshold
+        passed   = all_records[
+            all_records["result"].isin(["hit", "stopped", "settled"]) &
+            (all_records["z_at_entry"].fillna(0.0) >= z_thresh)
+        ]
+        # Filtered = candidates (z≥0) that don't meet this threshold
+        filtered = all_records[
+            all_records["z_at_entry"].fillna(0.0) < z_thresh
+        ]
 
-        entered  = records[records["result"].isin(["hit", "stopped", "settled"])]
-        filtered = records[records["result"] == "filtered"]
-
+        entered    = passed
         n_entered  = len(entered)
         n_filtered = len(filtered)
         n_total    = n_entered + n_filtered
 
         if n_entered == 0:
+            rows.append({
+                "z_thresh": z_thresh, "entered": 0, "filtered": n_filtered,
+                "filter_pct": 100.0,
+                "hit%": 0.0, "stop%": 0.0, "settle%": 0.0,
+                "avg_z": 0.0, "theory_p%": 0.0,
+                "exp_pnl_c": 0.0, "fee_adj_pnl": 0.0,
+                "sharpe": 0.0, "total_pnl_c": 0.0,
+            })
             continue
 
         hits    = (entered["result"] == "hit").sum()

@@ -177,7 +177,7 @@ def cmd_zscore(
     import pandas as pd
     from pathlib import Path
     from backtest.zscore_backtest import (
-        run_zscore_backtest, run_zscore_sweep,
+        run_zscore_backtest, run_zscore_sweep, _load_btc_1m,
         print_zscore_sweep, print_zscore_per_zone,
     )
     from core.z_score import Z_MIN_THRESHOLD
@@ -191,27 +191,32 @@ def cmd_zscore(
         if not ds_path.exists():
             print(f"  {name}: dataset not found — run build first")
             continue
-        df = pd.read_parquet(ds_path)
-        print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
-              f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
+        df      = pd.read_parquet(ds_path)
+        btc_1m  = _load_btc_1m(ASSETS[name])
+        if btc_1m is not None:
+            print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+                  f"{len(df):,} ticks, {df['ticker'].nunique()} markets  "
+                  f"[1m price history: {len(btc_1m):,} candles]")
+        else:
+            print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+                  f"{len(df):,} ticks, {df['ticker'].nunique()} markets  "
+                  f"[WARNING: 1m price file not found — z-scores may be degraded]")
 
         if single_z is not None:
-            # Single threshold — show sweep row + per-zone detail
-            records = run_zscore_backtest(df, z_threshold=single_z, zone_filter=zone_filter)
+            records = run_zscore_backtest(df, z_threshold=single_z,
+                                          zone_filter=zone_filter, btc_1m=btc_1m)
             if not records.empty:
                 print_zscore_per_zone(records, name, single_z)
         else:
-            # Sweep z from z_min to z_max
-            import numpy as np
-            z_values = sorted(set(
-                [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0]
-            ))
+            z_values = sorted({0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0})
             z_values = [z for z in z_values if z_min <= z <= z_max]
-            results = run_zscore_sweep(df, z_values=z_values, zone_filter=zone_filter)
+            results = run_zscore_sweep(df, z_values=z_values,
+                                       zone_filter=zone_filter, btc_1m=btc_1m)
             print_zscore_sweep(results, name, zone_filter)
 
             # Also print per-zone breakdown at the spec default threshold
-            records = run_zscore_backtest(df, z_threshold=Z_MIN_THRESHOLD, zone_filter=zone_filter)
+            records = run_zscore_backtest(df, z_threshold=Z_MIN_THRESHOLD,
+                                          zone_filter=zone_filter, btc_1m=btc_1m)
             if not records.empty:
                 print_zscore_per_zone(records, name, Z_MIN_THRESHOLD)
 
