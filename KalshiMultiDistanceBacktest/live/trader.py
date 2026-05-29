@@ -38,7 +38,7 @@ from live.config import (
     EWMA_DECAY, MIN_SIGMA_FLOOR,
 )
 from live.price_feed import BinancePriceFeed
-from live.market_scanner import scan_active_markets, cache_open_price
+from live.market_scanner import scan_active_markets
 from core.z_score import compute_z_score
 
 logging.basicConfig(
@@ -67,9 +67,6 @@ class LiveTrader:
         self.open_positions: dict[str, dict] = {}   # ticker → position
         self.daily_pnl: float = 0.0
         self.trade_log: list[dict] = []
-
-        # Track open_price per market (keyed by close_ts)
-        self._open_prices: dict[int, float] = {}    # close_ts → BTC at open
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -104,13 +101,6 @@ class LiveTrader:
                 time.sleep(1)
                 continue
 
-            # Cache the current BTC price keyed to the next 15m boundary
-            # (used as open_price when that market enters its last 90s)
-            next_boundary = ((_now_ts() // 900) + 1) * 900
-            if next_boundary not in self._open_prices:
-                self._open_prices[next_boundary] = btc_price
-                cache_open_price(next_boundary, btc_price)
-
             # ── Scan for markets entering our window ──────────────────────
             if now - last_scan >= SCAN_INTERVAL_SEC:
                 last_scan = now
@@ -134,20 +124,17 @@ class LiveTrader:
         for mkt in markets:
             ticker   = mkt["ticker"]
             t_left   = mkt["t_left"]
-            ask      = mkt["ask"]       # YES ask (0-1 fraction)
-            open_price = mkt["open_price"]
+            ask    = mkt["ask"]    # YES ask (0-1 fraction)
+            strike = mkt["strike"] # real market strike in dollars
 
             if ticker in self.open_positions:
                 continue
             if t_left < T_ENTER_MIN or t_left > T_ENTER_MAX:
                 continue
-            if open_price <= 0 or open_price == btc_price:
-                # open_price fell back to current price — not reliable, skip
-                continue
 
             z, sigma = compute_z_score(
                 btc_price       = btc_price,
-                strike          = open_price,
+                strike          = strike,
                 t_remaining_sec = t_left,
                 price_history   = btc_history,
                 ewma_decay      = EWMA_DECAY,
@@ -155,10 +142,10 @@ class LiveTrader:
             )
 
             if z >= Z_THRESHOLD:
-                self._enter(ticker, "YES", ask, z, t_left, open_price, btc_price)
+                self._enter(ticker, "YES", ask, z, t_left, strike, btc_price)
             elif z <= -Z_THRESHOLD:
                 no_ask = 1.0 - mkt["bid"]   # cost to buy NO = 1 - YES bid
-                self._enter(ticker, "NO", no_ask, z, t_left, open_price, btc_price)
+                self._enter(ticker, "NO", no_ask, z, t_left, strike, btc_price)
 
     def _enter(
         self,
@@ -167,7 +154,7 @@ class LiveTrader:
         ask: float,
         z: float,
         t_left: float,
-        open_price: float,
+        strike: float,
         btc_price: float,
     ) -> None:
         entry_dollars = ask
@@ -188,7 +175,7 @@ class LiveTrader:
             "entry_ask":   ask,
             "z":           z,
             "t_left":      t_left,
-            "open_price":  open_price,
+            "strike":      strike,
             "btc_at_entry": btc_price,
             "contracts":   CONTRACTS,
             "entry_time":  _now_ts(),
