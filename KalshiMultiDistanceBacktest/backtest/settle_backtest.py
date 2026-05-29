@@ -120,7 +120,7 @@ def run_settle_sweep(
         avg_entry = candidates["entry_c"].mean()
 
         # Break-even win rate for this avg entry price
-        be_rate = (avg_entry + _fee(avg_entry) * 2) / 100.0
+        be_rate = min(1.0, (avg_entry + _fee(avg_entry) * 2) / 100.0)
 
         rows.append({
             "z_thresh":        z_thresh,
