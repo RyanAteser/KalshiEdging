@@ -40,7 +40,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.z_score import compute_z_score
 
-FEE_CENTS      = 7.0    # per side
+FEE_RATE       = 0.07   # 7% of profit per side
+FEE_CAP        = 7.0    # capped at 7c per side
+
+
+def _fee(entry_c: float) -> float:
+    """Kalshi fee per side: 7% of potential profit, capped at 7c."""
+    return min(FEE_CAP, FEE_RATE * (100.0 - entry_c))
 BTC_HISTORY    = 30     # 1m candles
 
 # Only enter within these time windows (seconds remaining)
@@ -114,7 +120,7 @@ def run_settle_sweep(
         avg_entry = candidates["entry_c"].mean()
 
         # Break-even win rate for this avg entry price
-        be_rate = (avg_entry + FEE_CENTS * 2) / 100.0
+        be_rate = (avg_entry + _fee(avg_entry) * 2) / 100.0
 
         rows.append({
             "z_thresh":        z_thresh,
@@ -178,12 +184,12 @@ def _compute_all_obs(
                 entry_c = ask
                 won     = outcome == 1
                 pnl_nofee = (100 - entry_c) if won else -entry_c
-                pnl_c     = pnl_nofee - FEE_CENTS * 2
+                pnl_c     = pnl_nofee - _fee(entry_c) * 2
             else:
                 entry_c = 100 - ask          # cost of NO contract
                 won     = outcome == 0
                 pnl_nofee = (100 - entry_c) if won else -entry_c
-                pnl_c     = pnl_nofee - FEE_CENTS * 2
+                pnl_c     = pnl_nofee - _fee(entry_c) * 2
 
             rows.append({
                 "ticker":      ticker,
@@ -216,7 +222,7 @@ def print_settle_sweep(
     print(f"\n{'='*96}")
     print(f"  BUY-TO-SETTLE SWEEP — {asset}   side={side_str}")
     print(f"  Strategy: enter at first qualifying tick per market, hold to settlement")
-    print(f"  be_rate% = win rate needed just to break even after 14c fees at avg entry price")
+    print(f"  be_rate% = win rate needed just to break even after fees (7% of profit/side, cap 7c)")
     print(f"  ◀ = win_rate > be_rate  (profitable after fees)")
     print(f"  ★ = win_rate ≥ 99%")
     print(f"{'='*96}")

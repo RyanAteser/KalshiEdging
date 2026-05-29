@@ -40,7 +40,12 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.z_score import compute_z_score
 
-FEE_CENTS = 7.0   # per side
+FEE_RATE = 0.07   # 7% of profit per side
+FEE_CAP  = 7.0    # capped at 7c per side
+
+
+def _fee(entry_c: float) -> float:
+    return min(FEE_CAP, FEE_RATE * (100.0 - entry_c))
 
 BTC_HISTORY_WINDOW = 30   # 1m candles for vol history
 
@@ -116,10 +121,10 @@ def run_certainty_backtest(
             )
 
             # EV of buying YES at current ask, holding to settlement
-            ev_yes = outcome * (100 - ask) - (1 - outcome) * ask - FEE_CENTS * 2
+            ev_yes = outcome * (100 - ask) - (1 - outcome) * ask - _fee(ask) * 2
             # EV of buying NO at (100 - ask), holding to settlement
             no_price = 100 - ask
-            ev_no  = (1 - outcome) * (100 - no_price) - outcome * no_price - FEE_CENTS * 2
+            ev_no  = (1 - outcome) * (100 - no_price) - outcome * no_price - _fee(no_price) * 2
 
             rows.append({
                 "z":       z,

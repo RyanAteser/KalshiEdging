@@ -54,7 +54,12 @@ ENTRY_TOLERANCE_CENTS    = 2.0
 NO_CHASE_MAX_OVERSHOOT   = 2.0
 MIN_SECONDS_REMAINING    = 90.0
 COOLDOWN_TICKS_AFTER_EXIT = 3
-FEE_PER_CONTRACT_CENTS   = 7.0   # each side
+FEE_RATE               = 0.07   # 7% of profit per side
+FEE_CAP                = 7.0    # capped at 7c per side
+
+
+def _fee(entry_c: float) -> float:
+    return min(FEE_CAP, FEE_RATE * (100.0 - entry_c))
 
 # Number of 1-minute BTC candles to use for z-score history.
 # 30 candles = 30 minutes of realized vol — enough to capture recent vol regime.
@@ -321,7 +326,8 @@ def run_zscore_sweep(
         std_pnl  = float(pnls.std())  if len(pnls) > 1 else 1e-8
         sharpe   = mean_pnl / std_pnl * (n_entered ** 0.5)
 
-        fee_adj_pnl = mean_pnl - FEE_PER_CONTRACT_CENTS * 2
+        avg_entry_c = float(entered["entry_c"].mean()) if "entry_c" in entered.columns else 50.0
+        fee_adj_pnl = mean_pnl - _fee(avg_entry_c) * 2
 
         # Avg z and theoretical p_win for entered trades
         z_entered = entered["z_at_entry"].dropna()
@@ -414,7 +420,8 @@ def print_zscore_per_zone(
         pnls = z_trades["pnl_c"].dropna()
         avg_z    = float(z_trades["z_at_entry"].dropna().mean()) if len(z_trades) else 0.0
         mean_pnl = float(pnls.mean()) if len(pnls) else 0.0
-        fee_adj  = mean_pnl - FEE_PER_CONTRACT_CENTS * 2
+        avg_entry_c = float(z_trades["entry_c"].mean()) if "entry_c" in z_trades.columns else 50.0
+        fee_adj  = mean_pnl - _fee(avg_entry_c) * 2
         flag = " ◀" if fee_adj > 0 else ""
         print(
             f"  {zname:>5}  {n:>7,}  {hits/n*100:>5.1f}%  {stops/n*100:>5.1f}%  "
