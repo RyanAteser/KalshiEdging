@@ -227,6 +227,24 @@ def cmd_zscore(
                 print_zscore_per_zone(records, name, Z_MIN_THRESHOLD)
 
 
+def cmd_load_bulk(asset_filter=None, data_dir: str = ""):
+    if not data_dir:
+        print("  ERROR: --data-dir is required.  e.g. --data-dir E:/april_lastweek_15m")
+        return
+    from data.load_bulk import load_bulk_dataset
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        print(f"\n=== Loading bulk data: {name} from {data_dir} ===")
+        try:
+            load_bulk_dataset(name, ASSETS[name], data_dir=data_dir)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"  ERROR: {exc}")
+
+
 def cmd_settle(
     asset_filter=None,
     side: str = "yes",
@@ -475,7 +493,17 @@ def main():
                            [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]
                            if z_lo <= round(z,1) <= z_hi]
 
-    if cmd == "fetch":
+    # Parse --data-dir
+    data_dir = ""
+    for i, a in enumerate(args):
+        if a.startswith("--data-dir="):
+            data_dir = a.split("=", 1)[1]; break
+        if a == "--data-dir" and i + 1 < len(args):
+            data_dir = args[i + 1]; break
+
+    if cmd == "load-bulk":
+        cmd_load_bulk(asset, data_dir=data_dir)
+    elif cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
         cmd_build(asset)
