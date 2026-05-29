@@ -79,7 +79,7 @@ def run_settle_sweep(
         df["tick_time"] = pd.to_datetime(df["tick_time"], utc=True)
 
     # Pre-compute all observations once (z-score per tick across all markets)
-    all_obs = _compute_all_obs(df, btc_1m, side, t_min, t_max)
+    all_obs = _compute_all_obs(df, btc_1m, side, t_min, t_max, sample_every=30)
     if all_obs.empty:
         return pd.DataFrame()
 
@@ -139,6 +139,7 @@ def _compute_all_obs(
     side: str,
     t_min: float,
     t_max: float,
+    sample_every: int = 1,
 ) -> pd.DataFrame:
     """Compute z-score for every valid tick across all markets."""
     rows = []
@@ -154,7 +155,7 @@ def _compute_all_obs(
         strikes = mkt["strike"].values
         times   = mkt["tick_time"].values
 
-        for i in range(1, n):
+        for i in range(1, n, sample_every):
             t_left = float(t_lefts[i])
             if t_left < t_min or t_left > t_max:
                 continue
