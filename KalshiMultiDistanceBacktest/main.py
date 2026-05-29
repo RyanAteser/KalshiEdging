@@ -227,6 +227,34 @@ def cmd_zscore(
                 print_zscore_per_zone(records, name, Z_MIN_THRESHOLD)
 
 
+def cmd_settle(
+    asset_filter=None,
+    side: str = "yes",
+    z_values: list | None = None,
+):
+    import pandas as pd
+    from pathlib import Path
+    from backtest.settle_backtest import run_settle_sweep, print_settle_sweep
+    from backtest.zscore_backtest import _load_btc_1m
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            continue
+        df     = pd.read_parquet(ds_path)
+        btc_1m = _load_btc_1m(ASSETS[name])
+        print(f"\n{name} — {len(df):,} ticks, {df['ticker'].nunique()} markets  "
+              + (f"[1m candles: {len(btc_1m):,}]" if btc_1m is not None else "[no 1m data]"))
+
+        results = run_settle_sweep(df, btc_1m=btc_1m, side=side, z_values=z_values)
+        print_settle_sweep(results, name, side)
+
+
 def cmd_certainty(
     asset_filter=None,
     side: str = "both",
@@ -430,7 +458,7 @@ def main():
         if a == "--zone" and i + 1 < len(args):
             zone_arg = args[i + 1].upper(); break
 
-    # Parse --side (for certainty command)
+    # Parse --side (for certainty/settle commands)
     side_arg = "both"
     for i, a in enumerate(args):
         if a.startswith("--side="):
@@ -438,12 +466,24 @@ def main():
         if a == "--side" and i + 1 < len(args):
             side_arg = args[i + 1].lower(); break
 
+    # Parse --z-min / --z-max for settle sweep
+    settle_z_values = None
+    if cmd == "settle":
+        z_lo = z_min_val if z_min_val != 0.0 else 0.0
+        z_hi = z_max_val if z_max_val != 6.0 else 10.0
+        settle_z_values = [round(z, 1) for z in
+                           [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]
+                           if z_lo <= round(z,1) <= z_hi]
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
         cmd_build(asset)
     elif cmd == "backtest":
         cmd_backtest(asset)
+    elif cmd == "settle":
+        cmd_settle(asset, side=side_arg if side_arg != "both" else "yes",
+                   z_values=settle_z_values)
     elif cmd == "certainty":
         cmd_certainty(asset, side=side_arg)
     elif cmd == "zscore":
