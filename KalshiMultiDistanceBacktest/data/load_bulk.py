@@ -85,8 +85,11 @@ def load_bulk_dataset(
     prices_df["close_ts"] = prices_df["open_ts"] + pd.Timedelta(seconds=900)
     prices_df["t_left"]        = (prices_df["close_ts"] - prices_df["time"]).dt.total_seconds()
 
+    print(f"    t_left sample: min={prices_df['t_left'].min():.0f}  max={prices_df['t_left'].max():.0f}  "
+          f"median={prices_df['t_left'].median():.0f}")
     # Filter to valid window only
     prices_df = prices_df[(prices_df["t_left"] >= 0) & (prices_df["t_left"] <= 960)].copy()
+    print(f"    after t_left filter: {len(prices_df):,} rows")
 
     def _us(col): return col.dt.as_unit("us")
 
@@ -127,11 +130,13 @@ def load_bulk_dataset(
     )
 
     # ── Merge market meta ─────────────────────────────────────────────────
+    print(f"    prices_df before meta merge: {len(prices_df):,} rows")
     prices_df = prices_df.merge(
         market_meta[["slug" if "slug" in market_meta.columns else "ticker",
                      "strike", "outcome"]].rename(columns={"slug": "ticker"}),
         on="ticker", how="left"
     )
+    print(f"    prices_df after meta merge:  {len(prices_df):,} rows")
 
     # ── Build final columns ───────────────────────────────────────────────
     # YES side = Up side
@@ -141,6 +146,8 @@ def load_bulk_dataset(
 
     keep = ["ticker", "tick_time", "strike", "price", "ask", "bid",
             "t_left", "close_ts", "binance_price", "outcome"]
+    print(f"    NaN binance_price: {prices_df['binance_price'].isna().sum():,}  "
+          f"NaN strike: {prices_df['strike'].isna().sum():,}")
     df = prices_df[keep].dropna(subset=["binance_price", "strike"]).copy()
     df = df[df["strike"] > asset_cfg.get("min_strike", 0)].copy()
 
