@@ -52,7 +52,7 @@ def load_bulk_dataset(
     if not price_parts:
         raise RuntimeError(f"No price data found in {prices_dir}")
     prices_df = pd.concat(price_parts, ignore_index=True)
-    prices_df["time"] = pd.to_datetime(prices_df["time"], utc=True)
+    prices_df["time"] = pd.to_datetime(prices_df["time"], utc=True).dt.as_unit("us")
     prices_df = prices_df.sort_values("time").reset_index(drop=True)
     print(f"    {len(prices_df):,} price ticks across {prices_df['slug'].nunique()} markets")
 
@@ -68,7 +68,7 @@ def load_bulk_dataset(
     if not kline_parts:
         raise RuntimeError(f"No kline data found in {klines_dir}")
     klines = pd.concat(kline_parts, ignore_index=True)
-    klines["time"] = pd.to_datetime(klines["time"], utc=True)
+    klines["time"] = pd.to_datetime(klines["time"], utc=True).dt.as_unit("us")
     klines = klines.sort_values("time").reset_index(drop=True)
     print(f"    {len(klines):,} kline candles")
 
@@ -79,8 +79,10 @@ def load_bulk_dataset(
         return int(m.group(1)) if m else 0
 
     prices_df["close_ts_unix"] = prices_df["slug"].map(_close_ts)
-    prices_df["close_ts"]      = pd.to_datetime(prices_df["close_ts_unix"], unit="s", utc=True)
-    prices_df["open_ts"]       = prices_df["close_ts"] - pd.Timedelta(seconds=900)
+    prices_df["close_ts"] = pd.to_datetime(
+        prices_df["close_ts_unix"], unit="s", utc=True
+    ).dt.as_unit("us")
+    prices_df["open_ts"] = prices_df["close_ts"] - pd.Timedelta(seconds=900)
     prices_df["t_left"]        = (prices_df["close_ts"] - prices_df["time"]).dt.total_seconds()
 
     # Filter to valid window only
