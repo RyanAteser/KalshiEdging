@@ -88,21 +88,26 @@ def load_bulk_dataset(
     # Filter to valid window only
     prices_df = prices_df[(prices_df["t_left"] >= 0) & (prices_df["t_left"] <= 960)].copy()
 
+    def _us(col): return col.dt.as_unit("us")
+
     # ── Strike = BTC price at market open ────────────────────────────────
     market_meta = prices_df[["slug", "open_ts", "close_ts"]].drop_duplicates("slug").copy()
+    market_meta["open_ts"]  = _us(market_meta["open_ts"])
+    market_meta["close_ts"] = _us(market_meta["close_ts"])
     market_meta = market_meta.sort_values("open_ts").reset_index(drop=True)
 
-    klines_strike = klines[["time", "close"]].rename(
-        columns={"time": "open_ts", "close": "strike"}
-    )
+    klines_strike = klines[["time", "close"]].copy()
+    klines_strike["time"] = _us(klines_strike["time"])
+    klines_strike = klines_strike.rename(columns={"time": "open_ts", "close": "strike"})
     market_meta = pd.merge_asof(
         market_meta, klines_strike, on="open_ts", direction="nearest"
     )
 
     # ── Outcome = BTC at close > BTC at open (i.e. went Up) ──────────────
-    klines_close = klines[["time", "close"]].rename(
-        columns={"time": "close_ts", "close": "close_price"}
-    )
+    klines_close = klines[["time", "close"]].copy()
+    klines_close["time"] = _us(klines_close["time"])
+    klines_close = klines_close.rename(columns={"time": "close_ts", "close": "close_price"})
+    market_meta["close_ts"] = _us(market_meta["close_ts"])
     market_meta = market_meta.sort_values("close_ts").reset_index(drop=True)
     market_meta = pd.merge_asof(
         market_meta, klines_close, on="close_ts", direction="nearest"
@@ -110,10 +115,11 @@ def load_bulk_dataset(
     market_meta["outcome"] = (market_meta["close_price"] > market_meta["strike"]).astype(int)
 
     # ── Merge BTC price at each tick time ────────────────────────────────
-    klines_tick = klines[["time", "close"]].rename(
-        columns={"time": "tick_time", "close": "binance_price"}
-    )
+    klines_tick = klines[["time", "close"]].copy()
+    klines_tick["time"] = _us(klines_tick["time"])
+    klines_tick = klines_tick.rename(columns={"time": "tick_time", "close": "binance_price"})
     prices_df = prices_df.rename(columns={"time": "tick_time", "slug": "ticker"})
+    prices_df["tick_time"] = _us(prices_df["tick_time"])
     prices_df = prices_df.sort_values("tick_time").reset_index(drop=True)
     prices_df = pd.merge_asof(
         prices_df, klines_tick, on="tick_time", direction="backward"
