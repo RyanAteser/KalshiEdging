@@ -23,6 +23,12 @@ MIN_VOLUME       = 10     # reject if fewer than this many contracts on best ask
 
 MIN_STRIKE = 10_000.0     # BTC strike must be > $10k to be valid
 
+_open_price_cache: dict[int, float] = {}
+
+
+def cache_open_price(close_ts: int, btc_price: float) -> None:
+    _open_price_cache[close_ts] = btc_price
+
 
 def _now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
