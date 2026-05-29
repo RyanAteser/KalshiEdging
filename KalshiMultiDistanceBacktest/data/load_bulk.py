@@ -182,6 +182,20 @@ def load_bulk_dataset(
     df["streak"] = streaks
 
     df = df.sort_values("tick_time").reset_index(drop=True)
+
+    # ── Merge with existing dataset if present ────────────────────────────
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        existing["tick_time"] = pd.to_datetime(existing["tick_time"], utc=True)
+        before = existing["ticker"].nunique()
+        df = (
+            pd.concat([existing, df], ignore_index=True)
+            .drop_duplicates(["ticker", "tick_time"])
+            .sort_values("tick_time")
+            .reset_index(drop=True)
+        )
+        print(f"  Merged with existing dataset ({before} markets → {df['ticker'].nunique()} markets)")
+
     df.to_parquet(out_path, index=False)
 
     n_markets = df["ticker"].nunique()
