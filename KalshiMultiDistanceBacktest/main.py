@@ -34,6 +34,12 @@ Usage:
   %PY% main.py zscore --asset BTC --z-min 3.5              # single threshold detail
   %PY% main.py zscore --asset BTC --zone A                  # single zone
   %PY% main.py zscore --asset ETH
+
+  # Certainty map — z-score vs settlement outcome (where is outcome near-certain?)
+  %PY% main.py certainty --asset BTC                        # full YES+NO map
+  %PY% main.py certainty --asset BTC --side yes             # YES side only
+  %PY% main.py certainty --asset BTC --side no              # NO side only
+  %PY% main.py certainty --asset ETH
 """
 
 import sys
@@ -221,6 +227,35 @@ def cmd_zscore(
                 print_zscore_per_zone(records, name, Z_MIN_THRESHOLD)
 
 
+def cmd_certainty(
+    asset_filter=None,
+    side: str = "both",
+):
+    import pandas as pd
+    from pathlib import Path
+    from backtest.certainty_backtest import run_certainty_backtest, build_certainty_map, print_certainty_map
+    from backtest.zscore_backtest import _load_btc_1m
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            continue
+        df     = pd.read_parquet(ds_path)
+        btc_1m = _load_btc_1m(ASSETS[name])
+        print(f"\n{name} — {len(df):,} ticks, {df['ticker'].nunique()} markets  "
+              + (f"[1m candles: {len(btc_1m):,}]" if btc_1m is not None else "[no 1m data]"))
+        print("  Computing z-scores across all ticks (this may take ~30s)...")
+
+        obs     = run_certainty_backtest(df, btc_1m=btc_1m)
+        results = build_certainty_map(obs, side=side)
+        print_certainty_map(results, name, side=side)
+
+
 def cmd_scalp(
     asset_filter=None,
     buy_c: int = 60,
@@ -395,12 +430,22 @@ def main():
         if a == "--zone" and i + 1 < len(args):
             zone_arg = args[i + 1].upper(); break
 
+    # Parse --side (for certainty command)
+    side_arg = "both"
+    for i, a in enumerate(args):
+        if a.startswith("--side="):
+            side_arg = a.split("=", 1)[1].lower(); break
+        if a == "--side" and i + 1 < len(args):
+            side_arg = args[i + 1].lower(); break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
         cmd_build(asset)
     elif cmd == "backtest":
         cmd_backtest(asset)
+    elif cmd == "certainty":
+        cmd_certainty(asset, side=side_arg)
     elif cmd == "zscore":
         cmd_zscore(asset, z_min=z_min_val, z_max=z_max_val,
                    single_z=single_z, zone_filter=zone_arg)
