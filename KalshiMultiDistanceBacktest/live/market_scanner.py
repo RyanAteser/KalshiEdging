@@ -78,9 +78,10 @@ def scan_active_markets(client, btc_price: float) -> list[dict]:
     results = []
 
     try:
+        from pykalshi.enums import MarketStatus
         resp = client.get_markets(
             series_ticker=KALSHI_SERIES,
-            status="open",
+            status=MarketStatus.OPEN,
             limit=100,
         )
         markets = getattr(resp, "markets", None) or (resp if isinstance(resp, list) else [])
