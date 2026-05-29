@@ -100,7 +100,7 @@ def _simulate_market(
         # Prefer 1m candle data (gives dense, evenly-spaced history).
         # Fall back to Kalshi tick prices (sparse, but better than nothing).
         if btc_1m is not None:
-            tick_ts  = pd.Timestamp(times[i])
+            tick_ts  = pd.Timestamp(times[i], tz="UTC")
             mask     = btc_1m["open_time"] < tick_ts
             recent   = btc_1m.loc[mask, "close"].values[-BTC_HISTORY_WINDOW:]
             btc_window = list(recent) if len(recent) >= 5 else list(btc_tick[max(0, i-30):i])
