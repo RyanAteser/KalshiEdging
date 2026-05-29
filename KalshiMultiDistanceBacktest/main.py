@@ -28,6 +28,12 @@ Usage:
   %PY% main.py rl-train --asset BTC --timesteps 500000      # longer training
   %PY% main.py rl-eval  --asset BTC                         # evaluate on val set
   %PY% main.py rl-eval  --asset BTC --verbose               # per-trade log
+
+  # Z-score gated zone scalp backtest (KalshiZoneScalp validation)
+  %PY% main.py zscore --asset BTC                           # sweep all z thresholds
+  %PY% main.py zscore --asset BTC --z-min 3.5              # single threshold detail
+  %PY% main.py zscore --asset BTC --zone A                  # single zone
+  %PY% main.py zscore --asset ETH
 """
 
 import sys
@@ -159,6 +165,55 @@ def cmd_ladder(
                 from_below_c=from_below_c, from_above_c=from_above_c,
             )
             print_ladder_results(results, name, step_c, stop_loss_c, from_below_c, from_above_c)
+
+
+def cmd_zscore(
+    asset_filter=None,
+    z_min: float = 0.0,
+    z_max: float = 6.0,
+    single_z: float | None = None,
+    zone_filter: str | None = None,
+):
+    import pandas as pd
+    from pathlib import Path
+    from backtest.zscore_backtest import (
+        run_zscore_backtest, run_zscore_sweep,
+        print_zscore_sweep, print_zscore_per_zone,
+    )
+    from core.z_score import Z_MIN_THRESHOLD
+
+    assets = [asset_filter] if asset_filter else ENABLED_ASSETS
+    for name in assets:
+        if name not in ASSETS:
+            print(f"  Unknown asset: {name}")
+            continue
+        ds_path = Path("data") / f"dataset_{name.lower()}.parquet"
+        if not ds_path.exists():
+            print(f"  {name}: dataset not found — run build first")
+            continue
+        df = pd.read_parquet(ds_path)
+        print(f"\n{name} ({ASSETS[name]['kalshi_series']}) — "
+              f"{len(df):,} ticks, {df['ticker'].nunique()} markets")
+
+        if single_z is not None:
+            # Single threshold — show sweep row + per-zone detail
+            records = run_zscore_backtest(df, z_threshold=single_z, zone_filter=zone_filter)
+            if not records.empty:
+                print_zscore_per_zone(records, name, single_z)
+        else:
+            # Sweep z from z_min to z_max
+            import numpy as np
+            z_values = sorted(set(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0]
+            ))
+            z_values = [z for z in z_values if z_min <= z <= z_max]
+            results = run_zscore_sweep(df, z_values=z_values, zone_filter=zone_filter)
+            print_zscore_sweep(results, name, zone_filter)
+
+            # Also print per-zone breakdown at the spec default threshold
+            records = run_zscore_backtest(df, z_threshold=Z_MIN_THRESHOLD, zone_filter=zone_filter)
+            if not records.empty:
+                print_zscore_per_zone(records, name, Z_MIN_THRESHOLD)
 
 
 def cmd_scalp(
@@ -310,12 +365,40 @@ def main():
         if a == "--contracts" and i + 1 < len(args):
             contracts = int(args[i + 1]); break
 
+    # Parse --z-min / --z-max / --zone (for zscore command)
+    z_min_val = 0.0
+    z_max_val = 6.0
+    single_z: float | None = None
+    for i, a in enumerate(args):
+        if a.startswith("--z-min="):
+            z_min_val = float(a.split("=", 1)[1]); break
+        if a == "--z-min" and i + 1 < len(args):
+            z_min_val = float(args[i + 1]); break
+    for i, a in enumerate(args):
+        if a.startswith("--z-max="):
+            z_max_val = float(a.split("=", 1)[1]); break
+        if a == "--z-max" and i + 1 < len(args):
+            z_max_val = float(args[i + 1]); break
+    # --z-min used alone (no --z-max) = single threshold detail view
+    if "--z-min" in args and "--z-max" not in " ".join(args):
+        single_z = z_min_val
+
+    zone_arg: str | None = None
+    for i, a in enumerate(args):
+        if a.startswith("--zone="):
+            zone_arg = a.split("=", 1)[1].upper(); break
+        if a == "--zone" and i + 1 < len(args):
+            zone_arg = args[i + 1].upper(); break
+
     if cmd == "fetch":
         cmd_fetch(asset)
     elif cmd == "build":
         cmd_build(asset)
     elif cmd == "backtest":
         cmd_backtest(asset)
+    elif cmd == "zscore":
+        cmd_zscore(asset, z_min=z_min_val, z_max=z_max_val,
+                   single_z=single_z, zone_filter=zone_arg)
     elif cmd == "ladder":
         cmd_ladder(
             asset, step_c=step_c, stop_loss_c=stop_loss_c,
