@@ -78,11 +78,11 @@ def load_bulk_dataset(
         m = re.search(r"-(\d{9,})$", slug)
         return int(m.group(1)) if m else 0
 
-    prices_df["close_ts_unix"] = prices_df["slug"].map(_close_ts)
-    prices_df["close_ts"] = pd.to_datetime(
-        prices_df["close_ts_unix"], unit="s", utc=True
+    prices_df["open_ts_unix"] = prices_df["slug"].map(_close_ts)
+    prices_df["open_ts"]  = pd.to_datetime(
+        prices_df["open_ts_unix"], unit="s", utc=True
     ).dt.as_unit("us")
-    prices_df["open_ts"] = prices_df["close_ts"] - pd.Timedelta(seconds=900)
+    prices_df["close_ts"] = prices_df["open_ts"] + pd.Timedelta(seconds=900)
     prices_df["t_left"]        = (prices_df["close_ts"] - prices_df["time"]).dt.total_seconds()
 
     # Filter to valid window only
@@ -92,6 +92,7 @@ def load_bulk_dataset(
 
     # ── Strike = BTC price at market open ────────────────────────────────
     market_meta = prices_df[["slug", "open_ts", "close_ts"]].drop_duplicates("slug").copy()
+    # slug = open timestamp marker; close_ts = open + 900s
     market_meta["open_ts"]  = _us(market_meta["open_ts"])
     market_meta["close_ts"] = _us(market_meta["close_ts"])
     market_meta = market_meta.sort_values("open_ts").reset_index(drop=True)
